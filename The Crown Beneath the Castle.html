@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Crown Beneath the Castle</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: #0b0c10; color: #d9d2c2; font: 12px/1.3 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 10px; gap: 8px; }
+  #view { height: min(calc(100vh - 70px), 177.78vw - 36px); aspect-ratio: 9 / 16; position: relative; border-radius: 10px; overflow: hidden; background: #000; cursor: pointer; }
+  #view canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; display: block; }
+  .row { display: flex; gap: 8px; align-items: center; width: min(100%, 420px); }
+  button { font: inherit; color: #1b1620; background: #f2c230; border: 0; border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+  input[type=range] { flex: 1; accent-color: #f2c230; }
+  #tc { font-variant-numeric: tabular-nums; opacity: .7; }
+  #msg { display: none; padding: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="msg">This needs WebGL, which isn't available in this browser.</div>
+<div class="row"><button id="bPlay">Pause</button><button id="bRe">Restart</button><input id="scrub" type="range" min="0" max="1000" value="0" aria-label="Timeline"><span id="tc">00.0</span></div>
+<div class="row"><button id="bSound">Sound: off</button></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+'use strict';
+const view = document.getElementById('view');
+const fail = () => { view.style.display = 'none'; document.getElementById('msg').style.display = 'block'; };
+if (!window.THREE) return fail();
+const T = THREE, DT = 1 / 120, TAU = Math.PI * 2;
+const V = (x = 0, y = 0, z = 0) => new T.Vector3(x, y, z);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x)), lerp = (a, b, k) => a + (b - a) * k;
+const smooth = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const wrap = a => { a = (a + Math.PI) % TAU; if (a < 0) a += TAU; return a - Math.PI; };
+const lerpAngle = (a, b, k) => a + wrap(b - a) * k;
+const hash = n => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+const noise = (t, seed) => { const i = Math.floor(t), f = t - i, u = f * f * (3 - 2 * f); return lerp(hash(i + seed * 57.3), hash(i + 1 + seed * 57.3), u) * 2 - 1; };
+
+/* ================= renderer, lights, stage ================= */
+let renderer; try { renderer = new T.WebGLRenderer({ antialias: true, alpha: true }); } catch (e) { return fail(); }
+renderer.setClearColor(0x000000, 1);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = T.PCFSoftShadowMap;
+view.insertBefore(renderer.domElement, view.firstChild);
+const scene = new T.Scene(), camera = new T.PerspectiveCamera(24, 9 / 16, .1, 100);
+let mainRT = null; const uT = { value: 0 };
+function resize() { const w = view.clientWidth, h = view.clientHeight; if (!w || !h) return; const pr = Math.min(window.devicePixelRatio || 1, 2); renderer.setPixelRatio(pr); renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  const W = Math.round(w * pr), H = Math.round(h * pr); if (!mainRT) { mainRT = renderer.capabilities.isWebGL2 ? new T.WebGLMultisampleRenderTarget(W, H) : new T.WebGLRenderTarget(W, H); if (mainRT.isWebGLMultisampleRenderTarget) mainRT.samples = 4; } else mainRT.setSize(W, H); }
+window.addEventListener('resize', resize); resize();
+
+const hemi = new T.HemisphereLight(0xffffff, 0xb8aebf, .7); scene.add(hemi);
+const key = new T.DirectionalLight(0xfff1dc, .44); key.castShadow = true; key.shadow.mapSize.set(2048, 2048);
+Object.assign(key.shadow.camera, { left: -7.5, right: 7.5, top: 8, bottom: -5, near: 1, far: 30 }); key.shadow.bias = -.0008; key.shadow.normalBias = .035; key.shadow.radius = 3;
+scene.add(key, key.target);
+const KEY_OFF = V(-3.2, 7.5, 5.2);
+
+const INK = 0x2b2030, SKIN = 0xf6d7b0, HAIR = 0x17111f, TUNIC = 0xf1e6cc, PANTS = 0x2c2640, SHOE = 0x6b5a6e, SOLE = 0xf1e6cc, ACC = 0xb5d95a, BELT = 0x5c3b33, EYE = 0xf8f1dc;
+
+const ramp = new T.DataTexture(new Uint8Array([160, 160, 160, 200, 200, 200, 240, 240, 240, 255, 255, 255]), 4, 1, T.RGBFormat);
+ramp.minFilter = ramp.magFilter = T.LinearFilter; ramp.needsUpdate = true;
+const bodyMat = new T.MeshToonMaterial({ vertexColors: true, gradientMap: ramp });
+bodyMat.onBeforeCompile = sh => { sh.fragmentShader = sh.fragmentShader.replace('#include <tonemapping_fragment>',
+  'float rimF = pow(1.0 - clamp(dot(normalize(normal), normalize(vViewPosition)), 0.0, 1.0), 2.8);\n gl_FragColor.rgb += vec3(1.0, 0.95, 0.86) * rimF * 0.2 * smoothstep(-0.3, 0.7, normal.y + normal.x * 0.5);\n #include <tonemapping_fragment>'); };
+const inkMat = new T.ShaderMaterial({ side: T.BackSide, uniforms: { w: { value: .018 } },
+  vertexShader: 'uniform float w; void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); mv.xyz += normalize(normalMatrix * normal) * w; gl_Position = projectionMatrix * mv; }',
+  fragmentShader: 'void main(){ gl_FragColor = vec4(0.0200, 0.0103, 0.0253, 1.0); }' });
+
+/* merged, vertex-coloured parts: one mesh + one outline per bone */
+const _c = new T.Color(), _n3 = new T.Matrix3(), _v = V();
+class Part {
+  constructor() { this.it = []; }
+  add(g, color, p = [0, 0, 0], o = {}) { const q = new T.Quaternion(); if (o.q) q.copy(o.q); else if (o.r) q.setFromEuler(new T.Euler(o.r[0], o.r[1], o.r[2])); const s = o.s || [1, 1, 1];
+    this.it.push({ g, color, m: new T.Matrix4().compose(V(p[0], p[1], p[2]), q, V(s[0], s[1], s[2])) }); return this; }
+  geo() { let nv = 0, ni = 0; for (const i of this.it) { nv += i.g.attributes.position.count; ni += i.g.index.count; }
+    const P = new Float32Array(nv * 3), N = new Float32Array(nv * 3), C = new Float32Array(nv * 3), I = new Uint32Array(ni); let vo = 0, io = 0;
+    for (const { g, m, color } of this.it) { const p = g.attributes.position, n = g.attributes.normal; _n3.getNormalMatrix(m); _c.set(color).convertSRGBToLinear();
+      for (let k = 0; k < p.count; k++) { const o = (vo + k) * 3; _v.fromBufferAttribute(p, k).applyMatrix4(m); P[o] = _v.x; P[o + 1] = _v.y; P[o + 2] = _v.z;
+        _v.fromBufferAttribute(n, k).applyMatrix3(_n3).normalize(); N[o] = _v.x; N[o + 1] = _v.y; N[o + 2] = _v.z; C[o] = _c.r; C[o + 1] = _c.g; C[o + 2] = _c.b; }
+      const ix = g.index.array; for (let k = 0; k < ix.length; k++) I[io + k] = ix[k] + vo; vo += p.count; io += ix.length; }
+    const out = new T.BufferGeometry(); out.setAttribute('position', new T.BufferAttribute(P, 3)); out.setAttribute('normal', new T.BufferAttribute(N, 3)); out.setAttribute('color', new T.BufferAttribute(C, 3)); out.setIndex(new T.BufferAttribute(I, 1)); return out; }
+  mesh(parent, mat) { const g = this._g || (this._g = this.geo()), m = new T.Mesh(g, mat || bodyMat); m.castShadow = m.receiveShadow = true; m.add(new T.Mesh(g, inkMat)); parent.add(m); return m; }
+}
+const sph = (r, s = 36) => new T.SphereGeometry(r, s, Math.round(s * .7));
+function capsule(P, len, r0, r1, col) { P.add(new T.CylinderGeometry(r0, r1, len, 24, 1, true), col, [0, -len / 2, 0]); P.add(sph(r0, 24), col); P.add(sph(r1, 24), col, [0, -len, 0]); }
+const G = (p, x = 0, y = 0, z = 0) => { const g = new T.Group(); g.position.set(x, y, z); p.add(g); return g; };
+
+/* ================= skeleton ================= */
+const HIP = .84, L1 = .35, L2 = .35, ANK = .16, UA = .29, FA = .29;
+const footLift = p => { const c = Math.cos(p), s = Math.sin(p); return Math.max(0, .118 * c + .07 * s + Math.sqrt(.002025 * c * c + .059 * s * s) - ANK); };
+const root = G(scene), hips = G(root, 0, HIP, 0), spine = G(hips), chest = G(spine, 0, .42, 0), neck = G(chest, 0, .3, 0), head = G(neck, 0, .04, 0);
+
+// torso: one smooth mesh, soft-skinned between spine and chest
+let torsoMesh, torsoBase, torsoBaseN, torsoW;
+{ const P = new Part();
+  const prof = [[0, .7], [.1, .7], [.19, .67], [.25, .6], [.275, .48], [.27, .28], [.3, .08], [.345, -.1], [.33, -.14], [.2, -.15], [0, -.15]].map(p => new T.Vector2(p[0], p[1]));
+  P.add(new T.LatheGeometry(new T.SplineCurve(prof).getPoints(40).reverse(), 48), TUNIC, [0, 0, 0], { s: [1, 1, .78] });
+  P.add(new T.TorusGeometry(.272, .03, 12, 48), BELT, [0, .2, 0], { r: [Math.PI / 2, 0, 0], s: [1, .78, 1] });
+  P.add(sph(.04, 16), 0xe8c56a, [0, .2, .215]);
+  P.add(new T.TorusGeometry(.155, .07, 16, 40), ACC, [0, .7, .01], { r: [Math.PI / 2 - .12, 0, 0], s: [1.15, 1, 1] });
+  torsoMesh = P.mesh(spine); const g = torsoMesh.geometry; torsoBase = g.attributes.position.array.slice(); torsoBaseN = g.attributes.normal.array.slice();
+  torsoW = new Float32Array(torsoBase.length / 3); for (let i = 0; i < torsoW.length; i++) torsoW[i] = smooth(.1, .5, torsoBase[i * 3 + 1]); }
+{ const P = new Part(); P.add(new T.CylinderGeometry(.07, .08, .24, 20), SKIN, [0, 0, 0]); P.mesh(neck); }
+const _sq = new T.Quaternion(), _sv = V(), _sn = V();
+let lastSkin = '';
+function skinTorso(force) { const q = chest.quaternion, k = q.x.toFixed(6) + q.y.toFixed(6) + q.z.toFixed(6) + q.w.toFixed(6); if (!force && k === lastSkin) return; lastSkin = k;
+  const p = torsoMesh.geometry.attributes.position, n = torsoMesh.geometry.attributes.normal, P = p.array, N = n.array;
+  for (let i = 0; i < torsoW.length; i++) { const w = torsoW[i], o = i * 3; if (w === 0) continue;
+    _sv.set(torsoBase[o], torsoBase[o + 1] - .42, torsoBase[o + 2]).applyQuaternion(q); _sn.set(torsoBaseN[o], torsoBaseN[o + 1], torsoBaseN[o + 2]).applyQuaternion(q);
+    P[o] = lerp(torsoBase[o], _sv.x, w); P[o + 1] = lerp(torsoBase[o + 1], _sv.y + .42, w); P[o + 2] = lerp(torsoBase[o + 2], _sv.z, w);
+    N[o] = lerp(torsoBaseN[o], _sn.x, w); N[o + 1] = lerp(torsoBaseN[o + 1], _sn.y, w); N[o + 2] = lerp(torsoBaseN[o + 2], _sn.z, w); }
+  p.needsUpdate = n.needsUpdate = true; }
+
+// limbs: index 0 = his right (x<0), 1 = his left (x>0)
+const arms = [-1, 1].map(sx => { const clav = G(chest, sx * .1, .16, 0), up = G(clav, sx * .17, 0, 0), fore = G(up, 0, -UA, 0), hand = G(fore, 0, -FA, 0);
+  let P = new Part(); capsule(P, UA, .054, .051, SKIN); P.add(new T.CylinderGeometry(.086, .1, .22, 24, 1, true), TUNIC, [0, -.13, 0]); P.add(sph(.089, 24), TUNIC, [0, -.01, 0]); P.mesh(up);
+  P = new Part(); capsule(P, FA, .051, .047, SKIN); P.mesh(fore);
+  P = new Part(); P.add(sph(.082, 24), SKIN, [0, -.03, 0], { s: [1, 1.12, 1] }); P.add(sph(.034, 14), SKIN, [-sx * .02, -.03, .07]); P.mesh(hand);
+  return { sx, clav, up, fore, hand, ik: 0, ikT: 0, tgt: V() }; });
+const legs = [-1, 1].map(sx => { const thigh = G(hips, sx * .13, 0, 0), shin = G(thigh, 0, -L1, 0), foot = G(shin, 0, -L2, 0);
+  let P = new Part(); capsule(P, L1, .075, .071, PANTS); P.mesh(thigh);
+  P = new Part(); capsule(P, L2, .071, .065, PANTS); P.mesh(shin);
+  P = new Part(); P.add(sph(.15, 28), SHOE, [0, -.045, .07], { s: [1, .78, 1.55] }); P.add(sph(.15, 28), SOLE, [0, -.118, .07], { s: [1.06, .3, 1.62] }); P.add(sph(.085, 20), PANTS, [0, .03, -.01], { s: [1.15, .6, 1.15] }); P.mesh(foot);
+  return { sx, thigh, shin, foot, knee: V() }; });
+
+// head
+const HY = .44, HR = [.66, .5, .57], HC = V(0, .14, -.13), HS = [.69, .485, .585];
+const onHead = (x, y) => HR[2] * Math.sqrt(Math.max(0, 1 - (x / HR[0]) ** 2 - (y / HR[1]) ** 2));
+{ const P = new Part(); P.add(sph(1, 56), SKIN, [0, HY, 0], { s: HR });
+  for (const sx of [-1, 1]) { P.add(sph(.12, 20), SKIN, [sx * .655, HY - .06, -.02], { s: [.62, 1, .9] }); P.add(sph(.06, 12), 0xf0a4a0, [sx * .683, HY - .06, 0], { s: [.35, .9, .7] }); }
+  P.add(sph(1, 48), HAIR, [HC.x, HY + HC.y, HC.z], { s: HS }); P.mesh(head).receiveShadow = false; }
+function spikeGeo(len, rad, flat = 1) { const pts = []; for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push(new T.Vector2(Math.max(.0001, rad * Math.pow(1 - u, .8) * (1 - .12 * Math.sin(u * 3.14))), u * len)); }
+  const g = new T.LatheGeometry(pts, 20); if (flat !== 1) g.scale(1, 1, flat); return g; }
+const UP = V(0, 1, 0);
+const clumps = {};
+{ const piv = V(HC.x, HY + HC.y, HC.z), parts = { top: new Part(), back: new Part(), left: new Part(), right: new Part() };
+  const dirOf = (az, el) => { const a = az * Math.PI / 180, e = el * Math.PI / 180; return V(Math.sin(a) * Math.cos(e), Math.sin(e), Math.cos(a) * Math.cos(e)); };
+  const SP = [[95, 8, .5, .2], [128, -8, .56, .21], [160, 6, .5, .2], [195, -6, .58, .22], [228, 8, .52, .2], [262, -4, .5, .2], [80, 34, .46, .2], [120, 38, .52, .21], [165, 44, .5, .22], [210, 40, .54, .21], [250, 36, .48, .2], [285, 30, .42, .19],
+    [140, 68, .44, .2], [215, 70, .46, .2], [20, 74, .42, .17], [150, -30, .46, .2], [205, -32, .48, .2], [100, -22, .4, .18], [262, -24, .42, .18]];
+  for (const [az, el, len, rad] of SP) { const d = dirOf(az, el), lean = d.clone().add(V(0, .22, -.1)).normalize(), k = el >= 60 ? 'top' : az < 135 ? 'left' : az > 225 ? 'right' : 'back';
+    parts[k].add(spikeGeo(len, rad), HAIR, [d.x * HS[0] * .82, d.y * HS[1] * .82, d.z * HS[2] * .82], { q: new T.Quaternion().setFromUnitVectors(UP, lean) }); }
+  for (const k in parts) { const g = G(head, piv.x, piv.y, piv.z); parts[k].mesh(g); clumps[k] = { g, rx: 0, rz: 0, vx: 0, vz: 0 }; }
+  // fringe: flattened spikes lying on the forehead (flat side toward the face)
+  const fp = V(0, HY + .36, .3), F = new Part(), m = new T.Matrix4();
+  // three front spikes: built exactly like the rest of the hair, standing up and out from the front of the hair cap
+  for (const [az, el, len, rad] of [[-38, 42, .44, .19], [0, 44, .48, .2], [38, 42, .44, .19]]) { const d = dirOf(az, el), lean = d.clone().add(V(0, .22, -.1)).normalize();
+    F.add(spikeGeo(len, rad), HAIR, [HC.x + d.x * HS[0] * .82 - fp.x, HY + HC.y + d.y * HS[1] * .82 - fp.y, HC.z + d.z * HS[2] * .82 - fp.z], { q: new T.Quaternion().setFromUnitVectors(UP, lean) }); }
+  const g = G(head, fp.x, fp.y, fp.z); F.mesh(g); clumps.fringe = { g, rx: 0, rz: 0, vx: 0, vz: 0 }; }
+
+// eyes: blank ovals; lids, lid tilt and arch are drawn in the shader so each eye is fully posable
+const ER = [.185, .277];
+const eyes = [-1, 1].map(sx => { const g = G(head), geo = sph(1, 40); geo.scale(ER[0], ER[1], .032);
+  const mat = new T.ShaderMaterial({ uniforms: { lidU: { value: 1.3 }, lidL: { value: -1.3 }, tilt: { value: 0 }, arch: { value: 0 }, sil: { value: 0 }, sx: { value: sx } }, extensions: { derivatives: true },
+    vertexShader: 'varying vec2 vP; void main(){ vP = position.xy / vec2(' + ER[0] + ',' + ER[1] + '); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: `varying vec2 vP; uniform float lidU, lidL, tilt, arch, sil, sx;
+      void main(){ vec2 p = vP; if (sil > 0.5) { if (p.y > 0.28 + 0.6 * p.x * sx || p.y < -0.72 || dot(p, p) > 0.84) discard; gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; } float a = arch * (1.0 - p.x * p.x); float up = lidU + tilt * p.x + a, lo = lidL + a; float lw = 0.075;
+        vec3 ink = vec3(0.0200, 0.0103, 0.0253), eye = vec3(0.941, 0.883, 0.723);
+        if (up - lo < lw * 1.3) { float mid = (up + lo) * 0.5; if (abs(p.y - mid) > lw * 0.62 || dot(p, p) > 1.0) discard; gl_FragColor = vec4(ink, 1.0); return; }
+        if (p.y > up || p.y < lo) discard;
+        vec2 q = p * vec2(1.105, 1.068); float r = dot(q, q); float aa = fwidth(r) * 1.2;
+        float e = max(smoothstep(1.0 - aa, 1.0 + aa, r), max(smoothstep(up - lw - 0.02, up - lw + 0.02, p.y), 1.0 - smoothstep(lo + lw - 0.02, lo + lw + 0.02, p.y)));
+        gl_FragColor = vec4(mix(eye, ink, e), 1.0); }` });
+  const em = new T.Mesh(geo, mat); g.add(em); return { sx, g, u: mat.uniforms, mesh: em }; });
+
+// mouth + brows: one dynamic mesh wrapped onto the face
+const MN = 14, BN = 6, MOUTH_Y = -.27, BROW_Y = .322;
+const faceGeo = new T.BufferGeometry(); let facePos, faceStrips = {};
+{ const strips = [['fill', MN, 0x4a1f2c], ['teeth', MN, 0xfbf6e6], ['tongue', MN, 0xe07a7a], ['lu', MN, INK], ['ll', MN, INK], ['b0', BN, INK], ['b1', BN, INK]];
+  let nv = 0; for (const s of strips) nv += (s[1] + 1) * 2; facePos = new Float32Array(nv * 3); const col = new Float32Array(nv * 3), idx = []; let o = 0;
+  for (const [name, n, c] of strips) { faceStrips[name] = o; _c.set(c).convertSRGBToLinear(); for (let i = 0; i < (n + 1) * 2; i++) { col[(o + i) * 3] = _c.r; col[(o + i) * 3 + 1] = _c.g; col[(o + i) * 3 + 2] = _c.b; }
+    for (let i = 0; i < n; i++) { const a = o + i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); } o += (n + 1) * 2; }
+  faceGeo.setAttribute('position', new T.BufferAttribute(facePos, 3)); faceGeo.setAttribute('color', new T.BufferAttribute(col, 3)); faceGeo.setIndex(idx);
+  const m = new T.Mesh(faceGeo, new T.MeshBasicMaterial({ vertexColors: true, side: T.DoubleSide })); m.frustumCulled = false; m.userData.noSil = true; head.add(m); }
+const blushMat = new T.MeshBasicMaterial({ color: 0xee8f8a, transparent: true, opacity: .5, depthWrite: false });
+for (const sx of [-1, 1]) { const bx = sx * .44, by = -.2, b = new T.Mesh(new T.CircleGeometry(.085, 28), blushMat); b.position.set(bx, HY + by, onHead(bx, by) + .012); b.rotation.set(.25, sx * .78, 0); b.scale.y = .62; b.userData.noSil = true; head.add(b); }
+
+// scarf tail: three-link chain
+const tail = []; { let par = G(chest, -.14, .24, -.15); for (let i = 0; i < 3; i++) { const P = new Part(), r = .056 - i * .006;
+    P.add(new T.CylinderGeometry(r, r - .006, .13, 16, 1, true), ACC, [0, -.065, 0], { s: [1.3, 1, .6] }); P.add(sph(r, 16), ACC, [0, 0, 0], { s: [1.3, 1, .6] }); P.add(sph(r - .006, 16), ACC, [0, -.13, 0], { s: [1.3, 1, .6] }); P.mesh(par);
+    tail.push({ g: par, rx: 0, rz: 0, vx: 0, vz: 0 }); if (i < 2) par = G(par, 0, -.13, 0); } }
+
+// a prop to interact with
+const prop = new T.Group(); prop.visible = false; scene.add(prop);
+{ const P = new Part(); P.add(sph(.115, 28), 0xe0603c, [0, 0, 0], { s: [1, .92, 1] }); P.add(new T.CylinderGeometry(.012, .016, .07, 8), 0x5c3b33, [0, .12, 0]); P.add(sph(.04, 12), 0x6aa85a, [.045, .14, 0], { s: [1.3, .35, .7] }); P.mesh(prop); }
+const PROP_HOME = V(1.25, .11, .95), GRIP = V(0, -.15, .05);
+
+/* ================= story world: crown, sets, knights, living shadow ================= */
+const WALL_Z = -2.2, SH_X = -.75, PED_X = -1.25, CROWN_HOME = V(PED_X, 1.125, 0), CROWN_ON = V(0, .585, -.13), GRIP_R = .335, GRIP_Y = .06;
+// gold: stylised reflection bands, fresnel sheen and a travelling glint
+const goldMat = new T.ShaderMaterial({ uniforms: { uTime: uT, glow: { value: 1 } }, vertexColors: true, side: T.DoubleSide,
+  vertexShader: 'varying vec3 vN; varying vec3 vC; varying vec3 vW; varying vec3 vO; void main(){ vC = color; vO = position; vN = normalize(normalMatrix * normal); vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+  fragmentShader: `varying vec3 vN; varying vec3 vC; varying vec3 vW; varying vec3 vO; uniform float uTime, glow;
+    float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    void main(){ vec3 n = normalize(vN); bool back = !gl_FrontFacing; if (back) n = -n; vec3 L = normalize(vec3(-.35, .65, .68));
+      if (!(vC.r > .7 && vC.g > .4)) {                                   // gemstones: deep body colour, tight highlight, a little inner fire
+        float d = n.y * .5 + .5; vec3 gc = vC * (.22 + 1.15 * d * d) + vec3(1.) * pow(max(0., dot(n, L)), 60.) * 1.4 + vC * glow * .22; gl_FragColor = vec4(gc, 1.0); return; }
+      float an = atan(vO.x, vO.z), up = n.y, sky = smoothstep(-.35, .85, up);
+      float horizon = smoothstep(-.02, .1, up) * (1. - smoothstep(.3, .52, up)), under = smoothstep(-.9, -.3, up) * (1. - smoothstep(-.3, -.05, up));
+      float brushed = h21(vec2(floor(an * 70.), floor(vO.y * 22.))) * .07 - .035, hammer = sin(vO.y * 90. + an * 31.) * sin(an * 47. + vO.y * 40.) * .03;
+      vec3 dark = vec3(.2, .085, .012), mid = vec3(.82, .5, .08), light = vec3(1., .9, .55);
+      vec3 col = mix(dark, mid, clamp(sky + brushed + hammer, 0., 1.)); col = mix(col, light, horizon * .75) + mid * under * .35;   // bright horizon band + warm bounce from below
+      col += light * pow(max(0., dot(n, L)), 36.) * 1.1 + vec3(1., .8, .4) * pow(1. - abs(n.z), 3.) * .25;
+      col += light * pow(max(0., sin(vW.y * 9. + vW.x * 5. - uTime * 2.6)), 28.) * .8 * glow;                                          // travelling glint
+      if (back) col *= .4;
+      gl_FragColor = vec4(col * (.62 + .2 * glow), 1.0); }` });
+// one continuous piece of metal: band and five peaks share a single swept surface with real thickness
+function crownGeo() { const N = 180, M = 9, R0 = .262, B = .1, TH = .02, pos = [], idx = [], W = N + 1;
+  const H = a => { const u = ((a * 5 / TAU + .5) % 1 + 1) % 1 - .5, w = Math.abs(u); return B + .21 * Math.pow(Math.max(0, 1 - w * 2.5), 1.3) + .055 * Math.pow(Math.max(0, 1 - (.5 - w) * 10), 1.4); };
+  for (let sd = 0; sd < 2; sd++) for (let j = 0; j <= M; j++) for (let i = 0; i <= N; i++) { const a = i / N * TAU, y = H(a) * j / M, r = R0 * (1 + .13 * Math.pow(y / .31, 1.7)) - (sd ? TH : 0); pos.push(Math.sin(a) * r, y, Math.cos(a) * r); }
+  const id = (sd, j, i) => sd * (M + 1) * W + j * W + i;
+  for (let i = 0; i < N; i++) { for (let j = 0; j < M; j++) { let a = id(0, j, i), b = id(0, j, i + 1), c = id(0, j + 1, i), d = id(0, j + 1, i + 1); idx.push(a, b, d, a, d, c); a = id(1, j, i); b = id(1, j, i + 1); c = id(1, j + 1, i); d = id(1, j + 1, i + 1); idx.push(a, d, b, a, c, d); }
+    let a = id(0, M, i), b = id(0, M, i + 1), c = id(1, M, i), d = id(1, M, i + 1); idx.push(a, b, d, a, d, c); a = id(0, 0, i); b = id(0, 0, i + 1); c = id(1, 0, i); d = id(1, 0, i + 1); idx.push(a, d, b, a, c, d); }
+  const g = new T.BufferGeometry(); g.setAttribute('position', new T.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals(); return g; }
+const crown = new T.Group(); scene.add(crown);
+const crownLight = new T.PointLight(0xffc24a, 1.5, 9, 2); crownLight.position.y = .15; crown.add(crownLight);
+{ const P = new Part(), GOLD = 0xf2c230, R0 = .262, ring = (r, tube, y) => P.add(new T.TorusGeometry(r, tube, 10, 64), GOLD, [0, y, 0], { r: [Math.PI / 2, 0, 0] });
+  P.add(crownGeo(), GOLD); ring(R0 + .004, .021, .014); ring(R0 + .006, .012, .1); ring(R0 - .012, .012, .012);
+  for (let i = 0; i < 5; i++) { const a = i / 5 * TAU, b = a + TAU / 10, sa = Math.sin(a), ca = Math.cos(a), sb = Math.sin(b), cb = Math.cos(b), rt = R0 * 1.13 - .008;
+    P.add(sph(.032, 14), GOLD, [sa * rt, .335, ca * rt]); P.add(sph(.019, 10), GOLD, [sb * (R0 + .002), .168, cb * (R0 + .002)]);                 // pearls on the points
+    P.add(sph(1, 16), i % 2 ? 0x2a6fc0 : 0xc91f3a, [sa * (R0 + .01), .057, ca * (R0 + .01)], { s: [.04, .03, .02], r: [0, a, 0] });                // cabochons in bezels
+    P.add(new T.TorusGeometry(.04, .009, 8, 20), GOLD, [sa * (R0 + .006), .057, ca * (R0 + .006)], { r: [0, a, 0], s: [1, .78, 1] });
+    P.add(sph(.02, 10), i % 2 ? 0xc91f3a : 0x2a6fc0, [sb * (R0 + .008), .057, cb * (R0 + .008)], { s: [1, 1, .6], r: [0, b, 0] }); P.add(new T.TorusGeometry(.022, .006, 6, 16), GOLD, [sb * (R0 + .005), .057, cb * (R0 + .005)], { r: [0, b, 0] }); }
+  const g = P.geo(), m = new T.Mesh(g, goldMat); m.castShadow = true; m.layers.enable(1); m.add(new T.Mesh(g, inkMat)); crown.add(m);
+  const vp = new Part(); vp.add(sph(.245, 28), 0x7a1826, [0, .09, 0], { s: [1, .62, 1] }); const vm = vp.mesh(crown); vm.layers.enable(1); vm.children[0].layers.enable(1); m.children[0].layers.enable(1); }
+
+const sets = { vault: new T.Group(), hall: new T.Group() }; scene.add(sets.vault, sets.hall);
+function floorMat(col, wz) { const m = new T.MeshStandardMaterial({ color: col, roughness: 1, metalness: 0 }); m.onBeforeCompile = sh => {
+    sh.uniforms.wallZ = { value: wz };
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying vec3 vWp;').replace('#include <begin_vertex>', '#include <begin_vertex>\nvWp = (modelMatrix * vec4(position, 1.0)).xyz;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vWp; uniform float wallZ;\nfloat h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }')
+      .replace('#include <color_fragment>', '#include <color_fragment>\nvec2 tp = vWp.xz / 1.1; vec2 tid = floor(tp), tf = fract(tp); float tedge = min(min(tf.x, 1.0 - tf.x), min(tf.y, 1.0 - tf.y));\n diffuseColor.rgb *= (.7 + .4 * h21(tid)) * mix(.3, 1.0, smoothstep(.0, .035, tedge)) * (mod(tid.x + tid.y, 2.0) < .5 ? 1.0 : .82) * mix(.45, 1.0, smoothstep(0., 1.3, vWp.z - wallZ));'); }; return m; }
+// stone wall: procedural blocks, flickering light pools, and the projected shadow with its glowing eyes
+function wallMat(tint, glowCol) { return new T.ShaderMaterial({ uniforms: { uTime: uT, tint: { value: new T.Color(tint) }, glowCol: { value: new T.Color(glowCol) }, g1: { value: new T.Vector4(0, 2, 0, 1) }, g2: { value: new T.Vector4(0, 2, 0, 0) }, amb: { value: .1 },
+      tSh: { value: null }, shRect: { value: new T.Vector4(0, 0, 1, 1) }, shOn: { value: 0 }, eyeGlow: { value: 0 } },
+    vertexShader: 'varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+    fragmentShader: `varying vec3 vW; uniform float uTime, shOn, eyeGlow, amb; uniform vec3 tint, glowCol; uniform vec4 g1, g2, shRect; uniform sampler2D tSh;
+      float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      void main(){ vec2 p = vW.xy; float row = floor(p.y / .62); vec2 bp = vec2(p.x / 1.25 + mod(row, 2.0) * .5, p.y / .62); vec2 id = floor(bp), f = fract(bp);
+        float edge = min(min(f.x, 1. - f.x) * 1.25, min(f.y, 1. - f.y) * .62);
+        vec3 base = tint * (.62 + .38 * h21(id)) * mix(.35, 1., smoothstep(.0, .03, edge)) * (.88 + .12 * h21(floor(p * 45.)));
+        base *= 1. + .14 * smoothstep(.86, .97, f.y) - .16 * (1. - smoothstep(.03, .16, f.y));       // chiselled top edge, shaded bottom edge
+        base *= (p.y < .62 ? .8 : 1.) * mix(.5, 1., smoothstep(0., 1.0, p.y));                        // darker footing course, grime where wall meets floor
+        float f1 = .88 + .12 * sin(uTime * 9. + sin(uTime * 23.) * 1.5), f2 = .88 + .12 * sin(uTime * 8. + 2. + sin(uTime * 19.) * 1.5);
+        float d1 = distance(vW, g1.xyz), d2 = distance(vW, g2.xyz);
+        vec3 col = base * (amb + glowCol * (g1.w * f1 / (1. + d1 * d1 * .32) + g2.w * f2 / (1. + d2 * d2 * .32)));
+        col *= mix(1., .35, smoothstep(3.0, 7.5, p.y));
+        vec2 uv = (p - shRect.xy) / shRect.zw;
+        if (shOn > .5 && uv.x > 0. && uv.x < 1. && uv.y > 0. && uv.y < 1.) { float a = 0., r = 0.;
+          for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) { vec4 s = texture2D(tSh, uv + vec2(float(i), float(j)) * vec2(.0045, .0035)); a += s.a; r += s.r; }
+          a /= 9.; r /= 9.; col = mix(col, vec3(.003, .002, .007), min(1., a * 1.15) * .95); col += vec3(1.8, 1.25, .35) * r * eyeGlow; }
+        gl_FragColor = vec4(col, 1.0); }` }); }
+const wallV = wallMat(0x5a6078, 0xffc864), wallH = wallMat(0x8a7a70, 0xffa860);
+const stoneP = (parent, parts) => { const P = new Part(); for (const p of parts) P.add(p[0], p[1], p[2], p[3]); return P.mesh(parent); };
+{ // vault beneath the castle
+  const fl = new T.Mesh(new T.PlaneGeometry(40, 40), floorMat(0x565c70, -2.4)); fl.rotation.x = -Math.PI / 2; fl.receiveShadow = true; sets.vault.add(fl);
+  const w = new T.Mesh(new T.PlaneGeometry(40, 12), wallV); w.position.set(0, 6, -2.4); sets.vault.add(w);
+  const pedProf = [[0, 0], [.6, 0], [.6, .09], [.53, .12], [.5, .17], [.38, .22], [.31, .3], [.285, .5], [.3, .76], [.35, .84], [.45, .9], [.5, .95], [.5, 1.02], [.46, 1.05], [0, 1.05]].map(p => new T.Vector2(p[0], p[1]));
+  const colProf = [[0, 0], [.6, 0], [.6, .18], [.5, .26], [.44, .4], [.42, 6.4], [.5, 6.6], [.62, 6.8], [.62, 7], [0, 7]].map(p => new T.Vector2(p[0], p[1]));
+  stoneP(sets.vault, [[new T.BoxGeometry(1.36, .1, 1.36), 0x6e7488, [PED_X, .05, 0]], [new T.LatheGeometry(pedProf, 40), 0x8a90a4, [PED_X, .1, 0]], [new T.TorusGeometry(.33, .035, 10, 40), 0x9aa0b4, [PED_X, .4, 0], { r: [Math.PI / 2, 0, 0] }],
+    [sph(.36, 32), 0x7a1826, [PED_X, 1.15, 0], { s: [1, .14, 1] }],
+    [new T.LatheGeometry(colProf, 28), 0x6a7086, [1.9, 0, -1.75]], [new T.LatheGeometry(colProf, 28), 0x6a7086, [-3.1, 0, -1.75]]]);
+  // light shaft + dust
+  const shaft = new T.Mesh(new T.CylinderGeometry(.3, 1.05, 6.4, 40, 1, true), new T.ShaderMaterial({ uniforms: { uTime: uT }, transparent: true, depthWrite: false, side: T.DoubleSide, blending: T.AdditiveBlending,
+    vertexShader: 'varying vec3 vN; varying vec3 vV; varying vec2 vUv; varying vec3 vO; void main(){ vUv = uv; vO = position; vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }',
+    fragmentShader: `varying vec3 vN; varying vec3 vV; varying vec2 vUv; varying vec3 vO; uniform float uTime;
+      void main(){ float f = pow(abs(dot(normalize(vN), normalize(vV))), 1.8); float an = atan(vO.x, vO.z); float streak = .7 + .3 * sin(an * 9. + uTime * .5) * sin(an * 4. - uTime * .3);
+        float a = f * smoothstep(0., .22, vUv.y) * (.3 + .7 * vUv.y) * streak; gl_FragColor = vec4(vec3(1., .86, .55) * a * .03, 1.0); }` }));
+  shaft.position.set(PED_X, 3.3, 0); sets.vault.add(shaft);
+  const N = 110, pos = new Float32Array(N * 3), sd = new Float32Array(N * 3), rr = (() => { let a = 5; return () => { a = (a * 16807) % 2147483647; return a / 2147483647; }; })();
+  for (let i = 0; i < N; i++) { sd[i * 3] = rr(); sd[i * 3 + 1] = rr(); sd[i * 3 + 2] = rr(); }
+  const dg = new T.BufferGeometry(); dg.setAttribute('position', new T.BufferAttribute(pos, 3)); dg.setAttribute('seed', new T.BufferAttribute(sd, 3));
+  const dust = new T.Points(dg, new T.ShaderMaterial({ uniforms: { uTime: uT, scale: { value: 1 } }, transparent: true, depthWrite: false, blending: T.AdditiveBlending,
+    vertexShader: `attribute vec3 seed; uniform float uTime, scale; varying float vA; void main(){ float y = fract(seed.y + uTime * (.02 + seed.z * .03)); float an = seed.x * 6.283 + uTime * (.2 + seed.z * .3); float r = (.15 + .7 * seed.z) * (1.05 - y * .7);
+        vec3 p = vec3(${PED_X.toFixed(2)} + cos(an) * r, .2 + y * 5.5, sin(an) * r); vA = .35 + .65 * sin(uTime * 2. + seed.x * 40.) ; vec4 mv = modelViewMatrix * vec4(p, 1.0); gl_PointSize = scale * (2.0 + seed.z * 3.0) / -mv.z; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: 'varying float vA; void main(){ float d = length(gl_PointCoord - .5); if (d > .5) discard; gl_FragColor = vec4(vec3(1., .85, .5) * (1. - d * 2.) * .5 * vA, 1.0); }' }));
+  dust.frustumCulled = false; sets.vault.add(dust); sets.vault.userData.dust = dust; }
+const aoBlob = (() => { const c = document.createElement('canvas'); c.width = c.height = 128; const x = c.getContext('2d'), gr = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(8,5,14,.55)'); gr.addColorStop(.5, 'rgba(8,5,14,.22)'); gr.addColorStop(1, 'rgba(8,5,14,0)'); x.fillStyle = gr; x.fillRect(0, 0, 128, 128);
+  const m = new T.Mesh(new T.PlaneGeometry(1.25, .95), new T.MeshBasicMaterial({ map: new T.CanvasTexture(c), transparent: true, depthWrite: false })); m.rotation.x = -Math.PI / 2; m.position.y = .014; scene.add(m); return m; })();
+const knights = [];
+{ // great hall
+  const fl = new T.Mesh(new T.PlaneGeometry(40, 40), floorMat(0x8a7466, WALL_Z)); fl.rotation.x = -Math.PI / 2; fl.receiveShadow = true; sets.hall.add(fl);
+  const w = new T.Mesh(new T.PlaneGeometry(40, 12), wallH); w.position.set(0, 6, WALL_Z); sets.hall.add(w);
+  const cp = new T.Mesh(new T.PlaneGeometry(1.25, 14), new T.MeshStandardMaterial({ color: 0x7a2a2e, roughness: 1 })); cp.rotation.x = -Math.PI / 2; cp.position.set(0, .012, 5.2); cp.receiveShadow = true; sets.hall.add(cp);
+  const bw = new T.Mesh(new T.PlaneGeometry(40, 12), wallMat(0x5a4c48, 0xffa860)); bw.position.set(0, 6, 13); bw.rotation.y = Math.PI; bw.material.uniforms.g1.value.set(0, 3, 12, .5); bw.material.uniforms.amb.value = .12; sets.hall.add(bw);
+  const hallCol = [[0, 0], [.64, 0], [.64, .2], [.54, .3], [.47, .46], [.45, 8.2], [.54, 8.5], [.66, 8.7], [.66, 9], [0, 9]].map(p => new T.Vector2(p[0], p[1]));
+  stoneP(sets.hall, [[new T.LatheGeometry(hallCol, 28), 0x8a7c74, [2.9, 0, -1.7]], [new T.LatheGeometry(hallCol, 28), 0x8a7c74, [-3.3, 0, -1.7]]]);
+  // wall torches: iron sconce + a shader flame
+  const flameMat = new T.ShaderMaterial({ uniforms: { uTime: uT }, transparent: true, depthWrite: false, blending: T.AdditiveBlending,
+    vertexShader: 'uniform float uTime; varying float vY; varying vec3 vN; varying vec3 vV; void main(){ vY = position.y; vec3 p = position; float k = smoothstep(0., .34, p.y); p.x += sin(uTime * 11. + p.y * 14. + modelMatrix[3][0]) * .035 * k; p.z += cos(uTime * 9. + p.y * 11.) * .025 * k; vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(p, 1.0); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }',
+    fragmentShader: 'varying float vY; varying vec3 vN; varying vec3 vV; void main(){ float core = pow(abs(dot(normalize(vN), normalize(vV))), 1.6); vec3 col = mix(vec3(1., .32, .05), vec3(1., .86, .45), core) * (1.25 - vY * 2.2); gl_FragColor = vec4(col * core * 1.5, 1.0); }' });
+  const flameG = new T.LatheGeometry([[0, 0], [.07, .02], [.1, .1], [.075, .22], [.03, .34], [0, .42]].map(p => new T.Vector2(p[0], p[1])), 16);
+  for (const tx of [2.2, -2.6]) { stoneP(sets.hall, [[new T.BoxGeometry(.07, .5, .07), 0x33303a, [tx, 2.3, WALL_Z + .06]], [new T.BoxGeometry(.07, .07, .34), 0x33303a, [tx, 2.36, WALL_Z + .2]], [new T.CylinderGeometry(.11, .06, .2, 14), 0x3d3944, [tx, 2.5, WALL_Z + .36]], [new T.TorusGeometry(.11, .02, 8, 16), 0x4a4652, [tx, 2.6, WALL_Z + .36], { r: [Math.PI / 2, 0, 0] }]]);
+    const fm = new T.Mesh(flameG, flameMat); fm.position.set(tx, 2.6, WALL_Z + .36); sets.hall.add(fm); }
+  // knights: simple smooth figures sharing two sets of geometry
+  const STEEL = 0x7d8698, mkParts = col => { const lower = new Part(), upper = new Part(), helm = new Part();
+    lower.add(new T.LatheGeometry([[0, 0], [.46, 0], [.42, .5], [.33, .95], [0, .95]].map(p => new T.Vector2(p[0], p[1])), 28), col, [0, 0, 0], { s: [1, 1, .8] });
+    lower.add(sph(.15, 16), 0x2c2640, [-.17, .07, .2], { s: [1, .6, 1.5] }); lower.add(sph(.15, 16), 0x2c2640, [.17, .07, .2], { s: [1, .6, 1.5] });
+    upper.add(sph(.38, 24), STEEL, [0, .12, 0], { s: [1.1, .95, .85] }); upper.add(sph(.18, 16), STEEL, [-.44, .24, 0]); upper.add(sph(.18, 16), STEEL, [.44, .24, 0]);
+    for (const sx of [-1, 1]) { upper.add(new T.CylinderGeometry(.09, .08, .5, 14), STEEL, [sx * .47, -.04, .03]); upper.add(sph(.1, 14), 0x3a3348, [sx * .47, -.32, .04]); }
+    upper.add(new T.TorusGeometry(.33, .05, 10, 28), 0x5c3b33, [0, -.2, 0], { r: [Math.PI / 2, 0, 0], s: [1.1, .85, 1] });
+    upper.add(new T.TorusGeometry(.2, .06, 10, 24), 0x8c95a8, [0, .42, 0], { r: [Math.PI / 2, 0, 0] });                                   // gorget
+    for (const sx of [-1, 1]) upper.add(new T.TorusGeometry(.17, .028, 8, 20), 0x5f6778, [sx * .44, .2, 0], { r: [Math.PI / 2, 0, sx * .5] });   // pauldron rims
+    upper.add(new T.BoxGeometry(.06, .26, .03), 0xe8c56a, [0, .13, .325]); upper.add(new T.BoxGeometry(.2, .06, .03), 0xe8c56a, [0, .17, .322]);    // chest emblem
+    helm.add(sph(.5, 32), STEEL, [0, .42, 0], { s: [1.08, 1, 1.02] }); helm.add(sph(1, 16), INK, [0, .43, .455], { s: [.34, .05, .09] }); helm.add(new T.TorusGeometry(.5, .035, 8, 32), 0x7d8698, [0, .2, 0], { r: [Math.PI / 2, 0, 0], s: [1.08, 1.02, 1] });
+    helm.add(spikeGeo(.5, .13, .5), col, [0, .86, -.02], { r: [-.5, 0, 0] });
+    helm.add(new T.TorusGeometry(.5, .03, 8, 28, Math.PI), 0x5f6778, [0, .43, 0], { r: [0, Math.PI / 2, 0] }); helm.add(sph(1, 12), 0x5f6778, [0, .33, .49], { s: [.05, .12, .05] }); return { lower, upper, helm }; };
+  const PA = mkParts(0xc9483a), PB = mkParts(0x2f8f8c);
+  for (let r = 0; r < 5; r++) for (const sx of [-1, 1]) { const P = (r + (sx > 0 ? 1 : 0)) % 2 ? PA : PB, g = G(sets.hall, sx * 1.35, 0, 3.0 + r * 1.1); g.scale.setScalar(.8); g.userData.row = r; g.rotation.y = Math.atan2(-g.position.x, -.3 - g.position.z);
+    const lower = P.lower.mesh(g), up = G(g, 0, .95, 0); P.upper.mesh(up); const hd = G(up, 0, .5, 0); P.helm.mesh(hd); knights.push({ g, lower, up, hd, delay: r * .2 + (sx > 0 ? .07 : 0) }); } }
+const torchA = new T.PointLight(0xff9a50, 0, 9, 2), torchB = new T.PointLight(0xff9a50, 0, 9, 2); torchA.position.set(2.2, 2.85, WALL_Z + .55); torchB.position.set(-2.6, 2.85, WALL_Z + .55); scene.add(torchA, torchB);
+
+// the living shadow: the rig is re-posed and rendered as a silhouette, then projected onto the wall by the wall shader
+const SIL_W = 3.2, SIL_H = 4.4, silRT = new T.WebGLRenderTarget(512, 704), silCam = new T.OrthographicCamera(-SIL_W / 2, SIL_W / 2, SIL_H - .2, -.2, .1, 30); silCam.position.set(0, 0, 8);
+const silMat = new T.MeshBasicMaterial({ color: 0x000000 });
+const sword = G(arms[0].hand, 0, -.06, .0); { const mk = (g, y) => { const m = new T.Mesh(g, silMat); m.position.y = y; m.layers.set(1); sword.add(m); };
+  mk(new T.BoxGeometry(.13, 1.35, .03), -.78); mk(new T.ConeGeometry(.092, .2, 4), -1.55); sword.children[1].rotation.set(Math.PI, Math.PI / 4, 0); mk(new T.BoxGeometry(.46, .08, .06), -.1); } sword.visible = false;
+const bones = [], charMeshes = []; root.traverse(o => { if (o.isGroup) bones.push(o); if (o.isMesh && o.material !== silMat) { if (!o.userData.noSil) o.layers.enable(1); if (o.castShadow) charMeshes.push(o); } });
+for (const e of eyes) e.mesh.layers.enable(2);
+function snapPose(a) { for (let i = 0; i < bones.length; i++) { const b = bones[i], o = i * 10; a[o] = b.position.x; a[o + 1] = b.position.y; a[o + 2] = b.position.z; a[o + 3] = b.quaternion.x; a[o + 4] = b.quaternion.y; a[o + 5] = b.quaternion.z; a[o + 6] = b.quaternion.w; a[o + 7] = b.scale.x; a[o + 8] = b.scale.y; a[o + 9] = b.scale.z; } return a; }
+function restorePose(a) { for (let i = 0; i < bones.length; i++) { const b = bones[i], o = i * 10; b.position.set(a[o], a[o + 1], a[o + 2]); b.quaternion.set(a[o + 3], a[o + 4], a[o + 5], a[o + 6]); b.scale.set(a[o + 7], a[o + 8], a[o + 9]); } }
+
+
+/* ================= animation state ================= */
+const CN = ['hx', 'hy', 'hz', 'hrx', 'hry', 'hrz', 'srx', 'sry', 'srz', 'crx', 'cry', 'crz', 'hdx', 'hdy', 'hdz', 'sq', 'ax0', 'ay0', 'az0', 'el0', 'wr0', 'cl0', 'ax1', 'ay1', 'az1', 'el1', 'wr1', 'cl1'];
+const CI = {}; CN.forEach((n, i) => CI[n] = i); const NC = CN.length;
+const REST = new Float32Array(NC); REST[CI.az0] = REST[CI.az1] = .16; REST[CI.el0] = REST[CI.el1] = .16; REST[CI.sq] = 1;
+const OM = new Float32Array(NC).fill(13), ZE = new Float32Array(NC).fill(.62);
+for (let i = CI.ax0; i < NC; i++) { OM[i] = 12; ZE[i] = .5; } for (const k of ['hdx', 'hdy', 'hdz']) { OM[CI[k]] = 11; ZE[CI[k]] = .5; } OM[CI.sq] = 17; ZE[CI.sq] = .35; for (const k of ['hx', 'hy', 'hz']) { OM[CI[k]] = 14; ZE[CI[k]] = .62; }
+const cx = new Float32Array(NC), cv = new Float32Array(NC), tgt = new Float32Array(NC), add = new Float32Array(NC), val = new Float32Array(NC);
+function pose(o, w = 1) { if (w === 0) return; for (const k in o) { const i = CI[k]; if (i !== undefined) tgt[i] += o[k] * w; else { tgt[CI[k + '0']] += o[k] * w; tgt[CI[k + '1']] += o[k] * w; } } }
+const kick = (k, dv) => { const i = CI[k]; if (i !== undefined) cv[i] += dv; else { cv[CI[k + '0']] += dv; cv[CI[k + '1']] += dv; } };
+
+const FN = ['eSX', 'eSY', 'lidU', 'lidL', 'tilt', 'arch', 'browY', 'browR', 'browA', 'lidA', 'mW', 'smile', 'openU', 'openL', 'wave', 'skew', 'teeth', 'blush'];
+const FI = {}; FN.forEach((n, i) => FI[n] = i);
+const NEUT = { eSX: 1, eSY: 1, lidU: 1.3, lidL: -1.3, tilt: 0, arch: 0, browY: 0, browR: 0, browA: 0, lidA: 0, mW: .062, smile: .5, openU: 0, openL: 0, wave: 0, skew: 0, teeth: 0, blush: .5 };
+const EMOF = { neutral: {},
+  happy: { lidL: -.5, arch: .45, browY: .035, mW: .115, smile: 1, openL: .42, blush: 1, eSY: 1.03 },
+  sad: { lidU: .5, tilt: -.45, browY: .01, browR: -.55, mW: .06, smile: -.9, eSY: .96, blush: .3 },
+  angry: { lidU: .42, tilt: .6, lidL: -.85, browY: -.05, browR: .65, mW: .085, smile: -.55, openL: .16, openU: .05, teeth: 1, eSY: .95, blush: .85 },
+  shock: { eSX: 1.13, eSY: 1.15, browY: .085, mW: .05, smile: 0, openU: .3, openL: .5, blush: .2 },
+  fear: { eSX: 1.08, eSY: 1.12, tilt: -.3, lidU: 1.0, browY: .06, browR: -.6, mW: .1, smile: -.45, openU: .06, openL: .2, wave: 1, teeth: .8, blush: .1 },
+  confused: { lidA: .6, browA: .07, browR: -.1, mW: .055, smile: -.25, skew: .9, wave: .4, lidU: 1.1 },
+  laugh: { lidU: -.3, lidL: -.3, arch: .75, browY: .05, mW: .125, smile: .85, openU: .04, openL: .6, teeth: .7, blush: 1 },
+  awe: { eSX: 1.07, eSY: 1.12, browY: .07, mW: .045, smile: .1, openU: .12, openL: .3, blush: .8 },
+  proud: { lidU: .62, lidL: -.95, arch: .12, browY: .02, browR: .12, mW: .1, smile: .95, skew: .45, blush: .8 },
+  pain: { lidU: 0, lidL: 0, arch: -.4, tilt: .5, browY: -.04, browR: .7, mW: .09, smile: -.7, openL: .12, teeth: 1 } };
+const EMOB = { neutral: {},
+  happy: { srx: -.06, crx: -.05, cl: .1, az: .22, el: .4, hdz: .07 },
+  sad: { srx: .18, crx: .13, hdx: .14, hy: -.03, cl: -.14, az: -.08, el: -.06 },
+  angry: { srx: .14, crx: .05, hdx: .12, cl: .2, az: .22, el: 1.05, ax: .18, hy: -.03 },
+  shock: { srx: -.12, crx: -.08, hdx: -.02, az: .85, ax: -.3, el: 1.35, cl: .32, hz: -.06 },
+  fear: { hy: -.1, srx: .2, crx: .1, cl: .36, ax: -.95, az: -.08, el: 1.9, hz: -.08, hdx: .05 },
+  confused: { hdz: .24, hdy: .12, srz: -.05, ax1: -1.25, el1: 2.0, az1: -.1, cl1: .16, az0: .42, el0: 1.15, ay0: .5 },
+  laugh: { srx: -.1, crx: -.08, hdx: -.1, az: .2, el: 1.3, ax: -.2 }, pain: {},
+  awe: { srx: .1, crx: .04, hdx: -.12, az: .12, el: .5, ax: -.25 }, proud: { srx: -.09, crx: -.12, hdx: -.13, cl: .1, az: .5, el: 1.9, ax: .4, ay: 1.4 } };
+const fx = new Float32Array(FN.length), fv = new Float32Array(FN.length), ft = new Float32Array(FN.length);
+
+let S; const U = { yaw: 0, el: 0 };
+const sfxQ = [], emit = n => sfxQ.push([S.t, n]);
+function reset(reel) {
+  S = { t: 0, reel, ri: 0, seed: 7, gaitT: 0, press: 0, pos: V(), heading: 0, speed: 0, tspeed: 0, accel: 0, turn: 0, y: 0, vy: 0, air: false,
+    act: 'idle', phase: '', at: 0, queue: [], loop: false, moveSpeed: 1.25, moveTarget: null, face: null, gaitOn: false, ph: 0, feetFree: true, jumpRun: false, fromPose: null,
+    emo: 'neutral', emoT: 9, emoW: 1, idleW: 1, side: 1, nextShift: 2.4, holding: false, snap: 0, lookPropT: 0, look: '',
+    blinkT: -1, nextBlink: 1.7, blink2: false, glance: null, nextGlance: 2.2, gazeUser: V(), gazeUserT: -1,
+    g: { yaw: 0, pitch: 0, hy: 0, vhy: 0, hp: 0, vhp: 0, cy: 0, vcy: 0, ex: 0, vex: 0, ey: 0, vey: 0, lastYaw: 0 },
+    feet: [0, 1].map(i => ({ p: V((i ? 1 : -1) * .13, 0, 0), yaw: 0, pitch: 0, sw: false, from: V(), yaw0: 0, step: null, rel: false, relT: V() })),
+    cam: { shot: '', t: 0, pos: V(), tgt: V(), fov: 30, force: null },
+    set: 'vault', lookMode: '', crownGlow: 1, flash: 0, fade: 1, fadeT: 1, crowned: false, crownFrom: V(), knightsT: -1, shadow: { det: false, detT: 0, drawT: -1 }, snapB: null, sec: { prev: V(), vel: V(), init: false, cprev: V(), cvel: V() } };
+  sfxQ.length = 0;
+  cx.set(REST); cv.fill(0); fv.fill(0); FN.forEach((n, i) => fx[i] = NEUT[n]);
+  for (const k in clumps) Object.assign(clumps[k], { rx: 0, rz: 0, vx: 0, vz: 0 }); for (const s of tail) Object.assign(s, { rx: 0, rz: 0, vx: 0, vz: 0 });
+  for (const a of arms) { a.ik = 0; a.ikT = 0; a.cw = 0; }
+  scene.add(prop); prop.position.copy(PROP_HOME); prop.rotation.set(0, 0, 0); U.yaw = U.el = 0;
+  scene.add(crown); crown.position.copy(CROWN_HOME); crown.rotation.set(0, 0, 0);
+}
+const rnd = () => { S.seed = (S.seed * 16807) % 2147483647; return S.seed / 2147483647; };
+
+/* ================= commands ================= */
+const BUSY_OK = { idle: 1, stand: 1, walk: 1, run: 1, jump: 1, fall: 1 };
+const isFree = () => S.act === 'idle';
+function setEmo(e) { if (S.emo === e) return; S.emo = e; S.emoT = 0; if (e !== 'laugh' && e !== 'neutral') S.blinkT = 0;
+  if (e === 'shock') { kick('hy', 1.5); kick('sq', 1.0); kick('hdx', -2.5); } if (e === 'happy') { kick('hy', 1.1); } if (e === 'angry') { kick('hy', -.8); kick('hdx', 2); } if (e === 'fear') { kick('hz', -1.2); kick('cl', 2); } if (e === 'sad') kick('hdx', 1); if (e === 'laugh') kick('hdx', -2); }
+function startAct(a, phase) { S.act = a; S.phase = phase || ''; S.at = 0; }
+function cmd(c) {
+  const ci = c.indexOf(':'), k = ci < 0 ? c : c.slice(0, ci), arg = ci < 0 ? '' : c.slice(ci + 1), num = arg.split(',').map(parseFloat);
+  switch (k) {
+    case 'set': S.set = arg; if (arg === 'hall') S.crownGlow = .4; return;
+    case 'tp': S.pos.set(num[0], 0, num[1]); S.heading = num[2]; S.speed = 0; S.turn = 0; S.moveTarget = null; S.face = null; S.gaitOn = false; S.sec.init = false; Object.assign(S.g, { hy: 0, vhy: 0, hp: 0, vhp: 0, cy: 0, vcy: 0 });
+      S.feet.forEach((f, i) => { toWorld((i ? 1 : -1) * .13, 0, 0, f.p); f.yaw = num[2]; f.pitch = 0; f.sw = false; f.step = null; f.rel = false; }); return;
+    case 'goto': S.moveTarget = V(num[0], 0, num[1]); S.moveSpeed = num[2]; S.face = null; return;
+    case 'look': S.lookMode = arg; return;
+    case 'face': S.face = num[0]; return;
+    case 'fade': S.fadeT = num[0]; return;
+    case 'knights': S.knightsT = S.t; emit('bow'); return;
+    case 'detach': emit('dread'); S.shadow.det = true; S.shadow.detT = S.t; S.snapB = snapPose(new Float32Array(bones.length * 10)); return;
+    case 'draw': S.shadow.drawT = S.t; emit('draw'); return;
+    case 'crown': startAct('crown', 'reach'); return;
+  }
+  if (c.startsWith('emo:')) return setEmo(c.slice(4));
+  if (c.startsWith('cam:')) { S.cam.force = c.slice(4) === 'auto' ? null : c.slice(4); return; }
+  if (S.act === 'sit' && S.phase === 'hold') { S.fromPose = SITP; startAct('stand'); if (c !== 'sit' && c !== 'stand' && c !== 'idle') S.queue = [c]; return; }
+  if (!isFree()) { S.queue = [c]; return; }
+  if ((c === 'sit' || c === 'pickup') && S.speed > .06) { S.loop = false; S.moveTarget = null; S.queue = [c]; return; }
+  switch (c) {
+    case 'idle': case 'stand': S.loop = false; S.moveTarget = null; break;
+    case 'walk': S.loop = true; S.moveSpeed = 1.25; break;
+    case 'run': S.loop = true; S.moveSpeed = 3.6; break;
+    case 'jump': S.jumpRun = S.speed > 1; startAct('jump', 'crouch'); break;
+    case 'sit': startAct('sit', 'down'); break;
+    case 'fall': S.loop = false; S.moveTarget = null; startAct('fall', 'slip'); setEmo('shock'); for (const f of S.feet) { f.rel = true; f.sw = false; f.step = null; } S.gaitOn = false; break;
+    case 'pickup': { const tp = S.holding ? null : prop.position; startAct('pickup', 'approach');
+      if (tp) { const d = V(tp.x - S.pos.x, 0, tp.z - S.pos.z); const L = d.length(); if (L < .01) d.set(0, 0, 1); else d.multiplyScalar(1 / L);
+        S.face = Math.atan2(d.x, d.z); S.moveTarget = V(tp.x - d.x * .47 - d.z * .2, 0, tp.z - d.z * .47 + d.x * .2); S.moveSpeed = 1.25;
+      } else { S.face = S.heading; S.moveTarget = null; } break; }
+  }
+}
+const fwdX = () => Math.sin(S.heading), fwdZ = () => Math.cos(S.heading);
+const toWorld = (lx, ly, lz, out) => { const c = Math.cos(S.heading), s = Math.sin(S.heading); return out.set(S.pos.x + lx * c + lz * s, ly, S.pos.z - lx * s + lz * c); };
+
+/* ================= locomotion ================= */
+function locomotion() {
+  const g = S, grounded = !g.air && (g.act === 'idle' || g.act === 'jump' || (g.act === 'pickup' && g.phase === 'approach'));
+  let want = 0, aimX = 0, aimZ = 0, has = false;
+  if (g.act === 'fall' || g.act === 'sit' || g.act === 'stand') { want = 0; }
+  else if (g.moveTarget) { const dx = g.moveTarget.x - g.pos.x, dz = g.moveTarget.z - g.pos.z, d = Math.hypot(dx, dz); if (d < .06) { g.moveTarget = null; } else { has = true; aimX = dx; aimZ = dz; want = Math.min(g.moveSpeed, d * 2.4 + .25); } }
+  else if (g.loop && g.act !== 'pickup') { const a = Math.atan2(g.pos.x, g.pos.z) + .55, R = 2.4; has = true; aimX = Math.sin(a) * R - g.pos.x; aimZ = Math.cos(a) * R - g.pos.z; want = g.moveSpeed; }
+  if (g.act === 'jump' && !g.jumpRun) want = 0;
+  let turn = 0;
+  if (has) { const dh = wrap(Math.atan2(aimX, aimZ) - g.heading); turn = clamp(dh * 5, -3.2, 3.2); if (Math.abs(dh) > 1.2) want = Math.min(want, .5); }
+  else if (g.face !== null && g.speed < .1) { turn = clamp(wrap(g.face - g.heading) * 4, -2.2, 2.2); }
+  if (g.air) turn = 0;
+  g.turn += (turn - g.turn) * Math.min(1, DT * 6); g.heading = wrap(g.heading + g.turn * DT);
+  const prev = g.speed, dv = want - g.speed; if (!g.air) g.speed += clamp(dv, -(g.act === 'fall' ? 9 : 5) * DT, 3.4 * DT);
+  if (g.speed < .01 && want === 0) g.speed = 0;
+  g.accel += ((g.speed - prev) / DT - g.accel) * Math.min(1, DT * 8);
+  g.pos.x += fwdX() * g.speed * DT; g.pos.z += fwdZ() * g.speed * DT;
+  const moving = g.speed > .08 && grounded && g.act !== 'fall';
+  // gait pose layers
+  if (moving || (g.air && g.jumpRun)) { const r = smooth(1.7, 3.0, g.speed), k = smooth(.08, .7, g.speed), ph = g.ph * TAU;
+    const lean = lerp(.06, .3, r) * k + clamp(g.accel * .035, -.12, .16);
+    pose({ srx: lean, hdx: -lean * .55, crx: lean * .2, hrz: -g.turn * g.speed * .028, srz: -g.turn * g.speed * .012 });
+    pose({ el: lerp(.2, 1.35, r), az: lerp(0, .1, r), cl: lerp(0, .08, r) }, k);
+    if (moving) { const off = lerp(.04, .18, r), duty = lerp(.62, .36, r);
+      add[CI.hy] += -lerp(.03, .06, r) * Math.cos(2 * (ph - off * TAU)) * k - .012 * k;
+      add[CI.hx] += -lerp(.034, .014, r) * Math.cos(ph - duty * Math.PI) * k;
+      const yaw = lerp(.13, .2, r) * Math.cos(ph) * k; add[CI.hry] += yaw; add[CI.cry] += -yaw * 1.9; add[CI.hrz] += .035 * Math.sin(ph) * k; add[CI.crz] += -.03 * Math.sin(ph) * k;
+      add[CI.srx] += lerp(.012, .03, r) * Math.cos(2 * ph - 1.2) * k; add[CI.hdx] += -.02 * Math.cos(2 * ph - 2.0) * k;
+      const A = lerp(.5, .95, r) * k, hold = g.holding ? .25 : 1;
+      for (let i = 0; i < 2; i++) { const p = ph - (i ? 0 : Math.PI), w = i && g.holding ? hold : 1;       // arm i swings forward as the opposite leg does
+        add[CI['ax' + i]] += -A * Math.cos(p - .25) * w + lerp(0, .12, r) * k; add[CI['el' + i]] += lerp(.22, .34, r) * Math.cos(p - .85) * k * w + lerp(.1, .0, r) * k;
+        add[CI['wr' + i]] += .22 * Math.sin(p - 1.3) * k * w; add[CI['az' + i]] += .05 * Math.cos(p) * k * w; add[CI['cl' + i]] += .05 * Math.cos(p - .3) * k; } } }
+  return moving;
+}
+
+function feetUpdate(moving) {
+  const g = S, c = Math.cos(g.heading), s = Math.sin(g.heading), home = _v;
+  if (moving) { const r = smooth(1.7, 3.0, g.speed), stride = lerp(1.05, 2.3, r), duty = lerp(.62, .36, r), cyc = stride / Math.max(g.speed, .25);
+    if (!g.gaitOn) { g.gaitOn = true; g.gaitT = 0; g.ph = duty + .002; for (const f of g.feet) { f.step = null; f.rel = false; } }
+    g.ph = (g.ph + g.speed * DT / stride) % 1; const toe = lerp(.55, .9, r), heel = lerp(.32, .12, r);
+    for (let i = 0; i < 2; i++) { const f = g.feet[i], sx = i ? 1 : -1, fp = (g.ph + (i ? .5 : 0)) % 1;
+      if (fp >= duty) { const u = (fp - duty) / (1 - duty); if (!f.sw) { f.sw = true; f.from.copy(f.p); f.from.y = 0; f.yaw0 = f.yaw; }
+        const dist = g.speed * (1 - u) * (1 - duty) * cyc + duty * stride * .5, lat = lerp(.115, .05, r) * sx, e = u * u * (3 - 2 * u);
+        f.p.x = lerp(f.from.x, g.pos.x + lat * c + dist * s, e); f.p.z = lerp(f.from.z, g.pos.z - lat * s + dist * c, e);
+        f.p.y = lerp(.1, .3, r) * Math.sin(Math.PI * Math.pow(u, lerp(.9, .7, r))); f.yaw = lerpAngle(f.yaw0, g.heading, e);
+        f.pitch = u < .35 ? lerp(toe, 0, u / .35) : u > .6 ? lerp(0, -heel, (u - .6) / .4) : 0;
+      } else { if (f.sw) { f.sw = false; f.p.y = 0; emit('step'); } const st = fp / duty; f.pitch = st < .14 ? lerp(-heel, 0, st / .14) : st > .68 ? toe * smooth(.68, 1, st) : 0; } }
+    g.gaitT += DT; const pr = smooth(0, .3, g.gaitT); for (const f of g.feet) f.pitch *= pr;
+    return; }
+  if (g.gaitOn) { g.gaitOn = false; for (const f of g.feet) if (f.sw) { f.sw = false; f.step = { from: f.p.clone(), yaw0: f.yaw, t: 0, dur: .2, hh: .03 }; } }
+  for (let i = 0; i < 2; i++) { const f = g.feet[i], sx = i ? 1 : -1;
+    if (f.rel) { const k = 1 - Math.exp(-DT * 20), hyW = g.y + HIP + cx[CI.hy]; toWorld(f.relT.x, 0, f.relT.z + cx[CI.hz], home); f.p.x += (home.x - f.p.x) * k; f.p.z += (home.z - f.p.z) * k; f.p.y += (Math.max(0, hyW + f.relT.y - ANK) - f.p.y) * k; f.yaw = lerpAngle(f.yaw, g.heading, k); continue; }
+    if (f.step) { const st = f.step; st.t += DT; const u = Math.min(1, st.t / st.dur), e = u * u * (3 - 2 * u); toWorld(sx * .13, 0, 0, home);
+      f.p.x = lerp(st.from.x, home.x, e); f.p.z = lerp(st.from.z, home.z, e); f.p.y = lerp(st.from.y, 0, u) + st.hh * Math.sin(Math.PI * u); f.yaw = lerpAngle(st.yaw0, g.heading, e); f.pitch *= .85; if (u >= 1) { f.p.y = 0; f.step = null; emit('scuff'); } }
+    else { f.pitch *= .88; f.p.y *= .85; } }
+  if (g.feetFree && !g.air && !g.feet[0].step && !g.feet[1].step && !g.feet[0].rel && !g.feet[1].rel) { let best = -1, be = .085;
+    for (let i = 0; i < 2; i++) { const f = g.feet[i]; toWorld((i ? 1 : -1) * .13, 0, 0, home); const e = Math.hypot(f.p.x - home.x, f.p.z - home.z) + Math.abs(wrap(f.yaw - g.heading)) * .3; if (e > be) { be = e; best = i; } }
+    if (best >= 0) { const f = g.feet[best]; f.step = { from: f.p.clone(), yaw0: f.yaw, t: 0, dur: lerp(.2, .3, clamp(be, 0, 1)), hh: .07 }; } }
+}
+
+/* ================= actions ================= */
+const SITP = { hy: -.6, hz: -.34, srx: -.1, crx: .08 }, FALLP = { hy: -.62, hz: -.3, hrx: -.3, srx: .12, crx: .1, ax: .75, az: .3, el: -.05, hdx: .1 };
+const REACH = { hy: -.54, hz: -.16, srx: .66, crx: .28, hdx: -.25, ax0: .6, az0: .3 };
+const _w = V();
+function action() {
+  const g = S, a = g.at; g.at += DT; g.feetFree = true;
+  for (const ar of arms) ar.ikT = 0;
+  switch (g.act) {
+    case 'jump': {
+      if (g.phase === 'crouch') { const cT = g.jumpRun ? .12 : .28, k = smooth(0, cT, a); pose({ hy: -.25 * (g.jumpRun ? .5 : 1), srx: .34, crx: .1, hdx: -.22, ax: .8, el: .1, az: .12 }, k);
+        if (a >= cT) { g.phase = 'air'; g.at = 0; g.vy = 5.3; g.air = true; kick('hy', 2.2); kick('sq', 1.4); for (const f of g.feet) { f.rel = true; f.sw = false; f.step = null; } g.gaitOn = false; } }
+      else if (g.phase === 'air') { g.vy -= 16 * DT; g.y += g.vy * DT; const up = g.vy > 0, tuck = smooth(.05, .3, a) * (1 - smooth(.2, .0, g.y) * (up ? 0 : 1)), ext = !up && g.y < .5 ? 1 : 0;
+        pose(up ? { srx: -.14, crx: -.1, hdx: -.12, ax: -2.5, az: .25, el: .1, sq: .07 } : { srx: .1, hdx: .14, ax: -1.3, az: .8, el: .35 });
+        for (let i = 0; i < 2; i++) { const f = g.feet[i], sx = i ? 1 : -1; f.relT.set(sx * .13, ext ? -.685 : lerp(-.69, -.44, tuck), ext ? .03 : lerp(0, .1 + (i ? .06 : -.02), tuck)); f.pitch = lerp(f.pitch, ext ? 0 : .75, .12); }
+        if (g.y <= 0 && g.vy < 0) { g.y = 0; g.air = false; g.phase = 'land'; g.at = 0; for (const f of g.feet) { f.rel = false; f.p.y = 0; f.pitch = 0; } kick('hy', -3.0); kick('sq', -1.8); kick('hdx', 2.6); kick('ax', 3.5); kick('az', 2); kick('el', 2); S.blinkT = 0; } }
+      else { pose({ hy: -.2, srx: .26, ax: .2, az: .4, el: .3 }, 1 - smooth(.04, .3, a)); if (a > .5) { g.act = 'idle'; g.jumpRun = false; } }
+      break; }
+    case 'sit': { g.feetFree = false;
+      if (g.phase === 'down') { const k = smooth(0, .75, a), lean = Math.sin(Math.PI * smooth(0, .85, a)); pose(SITP, k); pose({ srx: .5, ax: -.75, el: .2, hdx: -.15 }, lean);
+        if (a > .8) { g.phase = 'hold'; kick('hy', .7); kick('sq', -1.0); kick('hdx', 1.5); } }
+      else { pose(SITP); for (let i = 0; i < 2; i++) if (!(i === 1 && g.holding)) { const ar = arms[i]; ar.ikT = 1; ar.tgt.copy(legs[i].knee); ar.tgt.y += .1; ar.tgt.x += fwdX() * .02; ar.tgt.z += fwdZ() * .02; } }
+      break; }
+    case 'stand': { const k = smooth(.22, .8, a), ant = Math.sin(Math.PI * smooth(0, .6, a)); pose(g.fromPose, 1 - k); pose({ srx: .5, hz: .12, ax: -.55, el: .3, hdx: .1 }, ant);
+      if (a > .9) { g.act = 'idle'; if (g.emo === 'confused' || g.emo === 'pain') setEmo('neutral'); } break; }
+    case 'fall': { g.feetFree = false;
+      if (g.phase === 'slip') { const k = smooth(0, .16, a), d = smooth(.1, .5, a), d2 = d * d;
+        pose({ hrx: -.55, srx: -.15, hdx: .25, ax: -2.6, az: .7, el: .1, hz: -.12 }, k); pose({ hy: -.62, hrx: .25, hz: -.18 }, d2);
+        for (let i = 0; i < 2; i++) { const f = g.feet[i], sx = i ? 1 : -1; f.relT.set(sx * lerp(.13, .17, d), lerp(-.5, -.04, d), lerp(.45, .62, d) + (i ? .06 : 0) * (1 - d)); f.pitch = lerp(f.pitch, -.35, .1); }
+        if (a >= .5) { g.phase = 'down'; g.at = 0; for (const f of g.feet) { f.rel = false; } kick('hy', 1.2); kick('sq', -2.2); kick('hdx', 5); kick('ax', 6); kick('crx', 2); setEmo('pain'); } }
+      else { pose(FALLP); if (a > .8 && g.emo === 'pain') setEmo('confused'); if (g.emo === 'confused') { add[CI.hdz] += .1 * Math.sin(g.t * 5.5); add[CI.hdy] += .08 * Math.sin(g.t * 3.7); }
+        if (a > 2.1) { g.fromPose = FALLP; startAct('stand'); } }
+      break; }
+    case 'crown': { const cp = crown.position, LEAN = { srx: .16, crx: .06, hdx: -.3, hz: -.03, hy: -.04 }, HOLD = { srx: .1, hdx: -.14 }, UPP = { srx: -.1, crx: -.08, hdx: -.3, ax: -1.7, az: .25, el: .3 }; let grip = 0;
+      if (g.phase === 'reach') { grip = smooth(.15, .8, a); pose(LEAN, smooth(0, .7, a)); if (a >= .9) { g.phase = 'lift'; g.at = 0; kick('hy', -.5); emit('touch'); } }
+      else if (g.phase === 'lift') { const u = smooth(0, 1.0, a); grip = 1; toWorld(0, 1.17, .58, _w); cp.set(lerp(CROWN_HOME.x, _w.x, u), lerp(CROWN_HOME.y, _w.y, u) + Math.sin(u * Math.PI) * .02, lerp(CROWN_HOME.z, _w.z, u));
+        pose(LEAN, 1 - u); pose(HOLD, u); g.crownGlow = 1 + .4 * u; if (a >= 1.1) { g.phase = 'hold'; g.at = 0; setEmo('awe'); } }
+      else if (g.phase === 'hold') { grip = 1; toWorld(0, 1.17 + .012 * Math.sin(a * 9), .58, cp); pose(HOLD); g.crownGlow = 1.4 + a; if (a >= .35) { g.phase = 'rise'; g.at = 0; g.crownFrom.copy(cp); emit('shimmer'); } }
+      else if (g.phase === 'rise') { const u = smooth(0, .9, a), v = 1 - u; grip = 1 - smooth(0, .25, a); toWorld(0, 2.2, 1.9, _w); _gt.set(0, HY, 0).applyMatrix4(head.matrixWorld); _gt.y += 1.3;   // arc that clears his face and hair
+        cp.set(v * v * g.crownFrom.x + 2 * u * v * _w.x + u * u * _gt.x, v * v * g.crownFrom.y + 2 * u * v * _w.y + u * u * _gt.y, v * v * g.crownFrom.z + 2 * u * v * _w.z + u * u * _gt.z);
+        crown.rotation.y = u * TAU * 1.5; g.crownGlow = 1.75 + .25 * u; pose(HOLD, v); pose(UPP, u); if (a >= .9) { g.phase = 'descend'; g.at = 0; g.crownFrom.copy(cp); } }
+      else if (g.phase === 'descend') { const u = smooth(0, .6, a); _w.set(CROWN_ON.x, HY + CROWN_ON.y, CROWN_ON.z).applyMatrix4(head.matrixWorld); cp.lerpVectors(g.crownFrom, _w, u * u); crown.rotation.y = TAU * 1.5 + u * TAU * .5; pose(UPP, 1 - u);
+        if (a >= .6) { head.add(crown); cp.set(CROWN_ON.x, HY + CROWN_ON.y, CROWN_ON.z); crown.rotation.set(-.05, 0, .08); g.crowned = true; emit('crown'); g.flash = 1; g.crownGlow = 1.2; kick('hy', -1.8); kick('sq', -1.3); kick('hdx', 1.6); setEmo('happy'); g.lookMode = 'cam'; g.phase = 'done'; g.at = 0; } }
+      else if (a > .5) g.act = 'idle';
+      if (grip > 0) { crown.getWorldPosition(_w); const c = Math.cos(g.heading), s = Math.sin(g.heading); for (let i = 0; i < 2; i++) { const ar = arms[i]; ar.ikT = grip; ar.tgt.set(_w.x + ar.sx * GRIP_R * c, _w.y + GRIP_Y, _w.z - ar.sx * GRIP_R * s); } }
+      break; }
+    case 'pickup': {
+      if (g.phase === 'approach') { g.lookPropT = g.t + .5; if (!g.moveTarget && g.speed < .05 && Math.abs(wrap(g.face - g.heading)) < .06 && !g.feet[0].step && !g.feet[1].step) { g.phase = 'reach'; g.at = 0; } }
+      else if (g.phase === 'reach') { g.feetFree = false; g.lookPropT = g.t + .5; const k = smooth(.12, .78, a); pose(REACH, k); const ar = arms[1]; ar.ikT = smooth(.2, .7, a);
+        if (g.holding) toWorld(.24, .25, .5, ar.tgt); else { ar.tgt.copy(prop.position); ar.tgt.y += .2; }
+        if (a >= .95) { hips.updateMatrixWorld(true);
+          if (!g.holding) { prop.getWorldPosition(_w); ar.hand.worldToLocal(_w); ar.hand.add(prop); prop.position.copy(_w); g.holding = true; g.snap = 0; }
+          else { prop.getWorldPosition(_w); scene.add(prop); prop.position.set(_w.x, .11, _w.z); prop.rotation.set(0, 0, 0); g.holding = false; }
+          g.phase = 'rise'; g.at = 0; } }
+      else { const k = 1 - smooth(0, .6, a); pose(REACH, k); arms[1].ikT = g.holding ? 0 : k * .6; if (!g.holding) { toWorld(.24, .3, .5, arms[1].tgt); } g.lookPropT = g.t + 1.4;
+        if (a > .35 && g.holding && g.emo === 'neutral') setEmo('happy'); if (a > .85) { g.act = 'idle'; g.face = null; } }
+      break; }
+  }
+  if (g.holding) { g.snap = Math.min(1, g.snap + DT * 7); prop.position.lerp(GRIP, 1 - Math.exp(-DT * 18)); }
+}
+
+function layers(moving) {
+  const g = S, t = g.t, idle = g.act === 'idle' && !moving;
+  g.idleW += ((idle ? 1 : 0) - g.idleW) * Math.min(1, DT * 4);
+  if (idle && t > g.nextShift) { g.side = -g.side; g.nextShift = t + 3.2 + rnd() * 3.2; }
+  const wi = g.idleW; pose({ hx: g.side * .05, hrz: g.side * .04, srz: -g.side * .045, crz: -g.side * .02, hdz: g.side * .03, hy: -.012 }, wi);
+  const bp = (t / 3.6) % 1, b = bp < .4 ? smooth(0, .4, bp) : 1 - smooth(.4, 1, bp); pose({ crx: -.03 * b, cl: .05 * b, az: .02 * b, sq: .012 * b });
+  add[CI.srx] += .012 * noise(t * .35, 1) * wi; add[CI.srz] += .012 * noise(t * .3, 2) * wi; add[CI.ax0] += .05 * noise(t * .4, 3) * wi; add[CI.ax1] += .05 * noise(t * .4, 4) * wi; add[CI.hdz] += .02 * noise(t * .25, 5);
+  // emotion body language
+  g.emoT += DT; const ew = g.act === 'idle' ? (moving ? .35 : 1) : (g.act === 'sit' && g.phase === 'hold') ? .6 : 0; g.emoW += (ew - g.emoW) * Math.min(1, DT * 6);
+  const E = EMOB[g.emo]; pose(E, g.emoW); const w = g.emoW;
+  if (g.emo === 'laugh') { const l = Math.abs(Math.sin(t * 12.5)), en = .6 + .4 * Math.sin(t * 1.7); add[CI.hy] += .022 * l * w * en; add[CI.crx] += -.045 * Math.sin(t * 12.5) * w * en; add[CI.hdx] += .05 * Math.sin(t * 12.5 + .8) * w; add[CI.cl0] += .12 * l * w; add[CI.cl1] += .12 * l * w; add[CI.sq] += .02 * l * w; }
+  if (g.emo === 'fear') { add[CI.hx] += .004 * noise(t * 11, 6) * w; add[CI.ax0] += .022 * noise(t * 10, 7) * w; add[CI.ax1] += .022 * noise(t * 9, 8) * w; add[CI.hdy] += .012 * noise(t * 8, 9) * w; }
+  if (g.emo === 'angry') { add[CI.ax0] += .03 * noise(t * 14, 10) * w; add[CI.ax1] += .03 * noise(t * 13, 11) * w; add[CI.hdy] += .012 * noise(t * 12, 12) * w; }
+  if (g.emo === 'happy') add[CI.hy] += .012 * Math.max(0, Math.sin(t * 5.2)) * w * (moving ? 0 : 1);
+  if (g.holding && !(g.act === 'pickup' && g.phase !== 'rise')) { const k = g.act === 'pickup' ? smooth(.05, .6, g.at) : 1, o = { ax1: -.55, el1: 1.2, az1: .0, wr1: -.25, ay1: 0, cl1: 0 };
+    for (const n in o) { const i = CI[n]; tgt[i] = lerp(tgt[i], REST[i] + o[n], k); } }
+}
+
+/* ================= gaze + face ================= */
+const _gt = V(), _hp = V();
+function sp(o, k, target, om, ze) { const vk = 'v' + k; o[vk] += (om * om * (target - o[k]) - 2 * ze * om * o[vk]) * DT; o[k] += o[vk] * DT; }
+function gaze(moving) {
+  const g = S, G_ = g.g, t = g.t; _hp.set(g.pos.x, g.y + HIP + cx[CI.hy] + 1.2, g.pos.z); let dart = 0;
+  const lm = g.lookMode;
+  if (lm === 'crown') crown.getWorldPosition(_gt); else if (lm === 'cam') _gt.copy(g.cam.pos); else if (lm === 'knights') _gt.set(0, 1.3, 5); else if (lm === 'wall') _gt.set(SH_X, 2.5, WALL_Z); else if (lm === 'ahead') toWorld(0, 1.9, 4, _gt);
+  else if (g.gazeUserT > t) _gt.copy(g.gazeUser);
+  else if (g.lookPropT > t) prop.getWorldPosition(_gt);
+  else if (g.emo === 'sad' && g.emoW > .3) toWorld(.2, 1.25, 2.4, _gt);
+  else if (g.emo === 'confused' && g.emoW > .3) toWorld(-.9, 3.2, 1.5, _gt);
+  else if (moving && g.speed > .3) toWorld(g.turn * .6, 1.9, 4, _gt);
+  else { if (t > g.nextGlance) { g.glance = rnd() < .58 ? null : V((rnd() - .5) * 3.4, 1.5 + rnd() * 1.4, 2.2); g.nextGlance = t + 1.4 + rnd() * 2.8; }
+    if (g.glance && g.emo === 'neutral') toWorld(g.glance.x, g.glance.y, g.glance.z, _gt); else _gt.copy(g.cam.pos); if (g.emo === 'fear') dart = 1; }
+  const dx = _gt.x - _hp.x, dy = _gt.y - _hp.y, dz = _gt.z - _hp.z, bh = g.heading + cx[CI.hry] + cx[CI.sry];
+  const lx = dx * Math.cos(bh) - dz * Math.sin(bh), lz = dx * Math.sin(bh) + dz * Math.cos(bh);
+  let yaw = Math.hypot(lx, lz) < .6 ? G_.lastYaw : Math.atan2(lx, lz), pitch = Math.atan2(dy, Math.hypot(lx, lz)); if (Math.abs(yaw) > 2.6 && Math.abs(G_.lastYaw) > .5 && yaw * G_.lastYaw < 0) yaw = -yaw;
+  yaw = clamp(yaw, -1.15, 1.15) + dart * .25 * noise(t * 2.6, 20); pitch = clamp(pitch, g.act === 'crown' ? -.22 : -.6, .55);
+  if (Math.abs(yaw - G_.lastYaw) > .55 && g.blinkT < 0) g.blinkT = 0; G_.lastYaw = yaw;
+  sp(G_, 'hy', yaw * .62, 7.5, .62); sp(G_, 'hp', pitch * .65, 7.5, .65); sp(G_, 'cy', yaw * .16, 5, .8);
+  sp(G_, 'ex', clamp((yaw - G_.hy - G_.cy) * 1.5, -1, 1), 24, .8); sp(G_, 'ey', clamp((pitch - G_.hp) * 1.8, -1, 1), 24, .8);
+}
+function face() {
+  const g = S, t = g.t, E = EMOF[g.emo];
+  for (let i = 0; i < FN.length; i++) { const n = FN[i]; ft[i] = E[n] !== undefined ? E[n] : NEUT[n]; }
+  if (g.emo === 'laugh') { ft[FI.openL] += .14 * Math.sin(t * 12.5); ft[FI.mW] += .008 * Math.sin(t * 12.5); }
+  if (g.emo === 'fear') { ft[FI.openL] += .05 * noise(t * 14, 30); }
+  if (g.emo === 'neutral') ft[FI.smile] += .12 * noise(t * .3, 31);
+  for (let i = 0; i < FN.length; i++) { const om = (i === FI.lidU || i === FI.lidL) ? 26 : 20, ze = (i === FI.lidU || i === FI.lidL || i === FI.arch) ? .85 : .5; fv[i] += (om * om * (ft[i] - fx[i]) - 2 * ze * om * fv[i]) * DT; fx[i] += fv[i] * DT; }
+  if (g.blinkT < 0 && t > g.nextBlink) { g.blinkT = 0; }
+  if (g.blinkT >= 0) { g.blinkT += DT; if (g.blinkT > .22) { g.blinkT = -1; if (!g.blink2 && rnd() < .22) { g.nextBlink = t + .12; g.blink2 = true; } else { g.nextBlink = t + 1.6 + rnd() * 3.6; g.blink2 = false; } } }
+}
+function blinkAmt() { const b = S.blinkT; return b < 0 ? 0 : b < .06 ? smooth(0, .06, b) : b < .09 ? 1 : 1 - smooth(.09, .22, b); }
+const facePt = (x, y, eps, o) => { facePos[o] = x; facePos[o + 1] = HY + y; facePos[o + 2] = onHead(x, y) + eps; };
+const ux = new Float32Array(MN + 1), uy = new Float32Array(MN + 1), lx_ = new Float32Array(MN + 1), ly = new Float32Array(MN + 1);
+function lineStrip(name, X, Y, n, lw, eps, taper) { let o = faceStrips[name] * 3; for (let i = 0; i <= n; i++) { const a = Math.max(0, i - 1), b = Math.min(n, i + 1); let tx = X[b] - X[a], ty = Y[b] - Y[a]; const L = Math.hypot(tx, ty) || 1; tx /= L; ty /= L;
+    const w = lw * .5 * (taper ? 1 - .55 * Math.pow(Math.abs(i / n * 2 - 1), 2) : 1); facePt(X[i] - ty * w, Y[i] + tx * w, eps, o); facePt(X[i] + ty * w, Y[i] - tx * w, eps, o + 3); o += 6; } }
+const bxA = new Float32Array(BN + 1), byA = new Float32Array(BN + 1);
+function faceApply() {
+  const g = S, f = k => fx[FI[k]], bl = blinkAmt(), G_ = g.g;
+  for (const e of eyes) { const i = e.sx < 0 ? 0 : 1, gx = G_.ex * .042, gy = G_.ey * .03, ex = e.sx * .255 + gx, ey = gy;
+    e.g.position.set(ex, HY + ey, onHead(ex, ey) - .015); e.g.rotation.y = e.sx * .42 + gx * 1.2; e.g.rotation.x = -gy * 1.2;
+    e.g.scale.set(f('eSX') * (1 - .07 * e.sx * G_.ex), f('eSY'), 1);
+    const lo = f('lidL'), up0 = f('lidU') - (i === 0 ? f('lidA') : 0); e.u.lidL.value = lo; e.u.lidU.value = lerp(up0, Math.min(up0, Math.max(lo, -.25)), bl); if (bl > 0) e.u.lidL.value = lerp(lo, Math.max(lo, -.25), bl);
+    e.u.tilt.value = f('tilt') * e.sx; e.u.arch.value = f('arch'); }
+  // mouth
+  const W = f('mW'), sm = f('smile'), oU = Math.max(0, f('openU')) * .1, oL = Math.max(0, f('openL')) * .1, sk = f('skew'), wv = f('wave'), teeth = clamp(f('teeth'), 0, 1);
+  let oF = faceStrips.fill * 3, oT = faceStrips.teeth * 3, oG = faceStrips.tongue * 3; const mx0 = G_.ex * .012;
+  for (let i = 0; i <= MN; i++) { const xi = i / MN * 2 - 1, shp = Math.sqrt(Math.max(0, 1 - xi * xi)), x = mx0 + W * xi;
+    const yc = MOUTH_Y + sm * W * (.3 - .6 * (1 - xi * xi)) + sk * W * .35 * xi + wv * .011 * Math.sin(xi * 7.5 + g.t * 9);
+    ux[i] = lx_[i] = x; uy[i] = yc + oU * shp; ly[i] = yc - oL * shp; const gap = uy[i] - ly[i];
+    facePt(x, uy[i], .006, oF); facePt(x, ly[i], .006, oF + 3); oF += 6;
+    const th = Math.min(gap * .42, .026) * teeth; facePt(x, uy[i], .007, oT); facePt(x, uy[i] - th, .007, oT + 3); oT += 6;
+    const tg = Math.min(gap * .4, .03) * smooth(.035, .07, oU + oL) * shp; facePt(x, ly[i] + tg, .007, oG); facePt(x, ly[i], .007, oG + 3); oG += 6; }
+  lineStrip('lu', ux, uy, MN, .018, .009, true); lineStrip('ll', lx_, ly, MN, .018, .009, true);
+  for (let b = 0; b < 2; b++) { const sx = b ? 1 : -1, cxb = sx * .255 + G_.ex * .02, by = BROW_Y + f('browY') + (b ? 1 : -1) * f('browA') + (f('eSY') - 1) * .25, R = f('browR');
+    for (let i = 0; i <= BN; i++) { const u = i / BN * 2 - 1; bxA[i] = cxb + sx * .1 * u; byA[i] = by + R * u * .1 + .018 * (1 - u * u); } lineStrip('b' + b, bxA, byA, BN, .022, .026, true); }
+  faceGeo.attributes.position.needsUpdate = true; blushMat.opacity = clamp(f('blush'), 0, 1) * .6;
+}
+
+/* ================= pose → bones, IK ================= */
+const qA = new T.Quaternion(), qB = new T.Quaternion(), qC = new T.Quaternion(), qD = new T.Quaternion(), mB = new T.Matrix4(), XA = V(1, 0, 0), YA = V(0, 1, 0);
+const vA = V(), vB = V(), vC = V(), vD = V(), vE = V(), vX = V(), vY = V(), vZ = V(), vT = V(), vP = V();
+function solve2(upper, lower, l1, l2, target, pole, kneeOut, qOut) {
+  const par = upper.parent; par.matrixWorld.decompose(vE, qA, vD); vA.copy(upper.position).applyMatrix4(par.matrixWorld);
+  vB.subVectors(target, vA); const full = l1 + l2, soft = full * .93, raw = vB.length(), leg = l1 === L1;   // legs get a soft limit: a nearly straight knee eases out instead of snapping
+  const d = clamp(leg && raw > soft ? soft + (full * .995 - soft) * (1 - Math.exp(-(raw - soft) / (full * .995 - soft))) : raw, Math.abs(l1 - l2) + .03, full * .997); vB.normalize();
+  vC.copy(pole).addScaledVector(vB, -pole.dot(vB)); if (vC.lengthSq() < 1e-6) vC.set(0, 0, 1); vC.normalize();
+  const cosA = clamp((l1 * l1 + d * d - l2 * l2) / (2 * l1 * d), -1, 1), sinA = Math.sqrt(1 - cosA * cosA);
+  vD.copy(vB).multiplyScalar(cosA).addScaledVector(vC, sinA); if (kneeOut) kneeOut.copy(vA).addScaledVector(vD, l1);
+  vX.crossVectors(vC, vB).normalize(); if (!leg) vX.negate(); vY.copy(vD).negate(); vZ.crossVectors(vX, vY); qB.setFromRotationMatrix(mB.makeBasis(vX, vY, vZ));
+  upper.quaternion.copy(qA).invert().multiply(qB);
+  vE.copy(vB).multiplyScalar(d).addScaledVector(vD, -l1).normalize().applyQuaternion(qC.copy(qB).invert());
+  const al = Math.atan2(-vE.z, -vE.y); lower.rotation.set(al, 0, 0); if (qOut) qOut.copy(qB).multiply(qC.setFromAxisAngle(XA, al));
+}
+function apply() {
+  const g = S, x = val, c = Math.cos(g.heading), s = Math.sin(g.heading);
+  root.position.set(g.pos.x, g.y, g.pos.z); root.quaternion.setFromAxisAngle(YA, g.heading);
+  // keep planted feet reachable: the pelvis gives way before a leg over-extends
+  let hy = HIP + x[CI.hy]; const R2 = (L1 + L2) * .975;
+  for (let i = 0; i < 2; i++) { const f = g.feet[i]; if (f.rel) continue; const sx = i ? 1 : -1, lx = sx * .13 + x[CI.hx], lz = x[CI.hz], hxw = g.pos.x + lx * c + lz * s, hzw = g.pos.z - lx * s + lz * c;
+    const lift = footLift(f.pitch), ay = f.p.y + ANK + lift - g.y, dd = (hxw - f.p.x) ** 2 + (hzw - f.p.z) ** 2;
+    hy = Math.min(hy, Math.sqrt(Math.max(.02, R2 * R2 - dd)) + ay); }
+  hips.position.set(x[CI.hx], hy, x[CI.hz]); hips.rotation.set(x[CI.hrx], x[CI.hry], x[CI.hrz]);
+  spine.rotation.set(x[CI.srx], x[CI.sry], x[CI.srz]); const sq = clamp(x[CI.sq], .7, 1.3), si = 1 / Math.sqrt(sq); spine.scale.set(si, sq, si);
+  chest.rotation.set(x[CI.crx], x[CI.cry] + g.g.cy, x[CI.crz]);
+  neck.rotation.set(-g.g.hp * .35, g.g.hy * .4, 0); head.rotation.set(x[CI.hdx] - g.g.hp * .65, x[CI.hdy] + g.g.hy * .6, x[CI.hdz]);
+  for (let i = 0; i < 2; i++) { const a = arms[i], sx = a.sx; a.clav.rotation.set(0, 0, sx * x[CI['cl' + i]]); a.up.rotation.set(x[CI['ax' + i]], sx * x[CI['ay' + i]], sx * x[CI['az' + i]]);
+    a.fore.rotation.set(-Math.max(0, x[CI['el' + i]]), 0, 0); a.hand.rotation.set(x[CI['wr' + i]], 0, 0); }
+  root.updateMatrixWorld(true);
+  for (let i = 0; i < 2; i++) { const f = g.feet[i], L = legs[i], lift = footLift(f.pitch);
+    vT.set(f.p.x, f.p.y + ANK + lift, f.p.z); vP.set(s * .6 + Math.sin(f.yaw) * .4 + L.sx * .16 * c, .12, c * .6 + Math.cos(f.yaw) * .4 - L.sx * .16 * s);
+    solve2(L.thigh, L.shin, L1, L2, vT, vP, L.knee, qD);
+    qC.setFromAxisAngle(YA, f.yaw).multiply(qA.setFromAxisAngle(XA, f.pitch)); L.foot.quaternion.copy(qD).invert().multiply(qC); }
+  for (let i = 0; i < 2; i++) { const a = arms[i]; a.ik += (a.ikT - a.ik) * (1 - Math.exp(-DT * 12)); if (a.ik < .002) continue;
+    const qF = a.up.quaternion.clone(), eF = a.fore.rotation.x; vP.set(a.sx * .6 * c - s, -.5, -a.sx * .6 * s - c);
+    solve2(a.up, a.fore, UA, FA, a.tgt, vP, null, null); qB.copy(a.up.quaternion); a.up.quaternion.copy(qF).slerp(qB, a.ik); a.fore.rotation.x = lerp(eF, a.fore.rotation.x, a.ik); }
+  // hand collision: a hand entering the head or torso is slid out to the surface and the arm re-solved; the correction fades in with depth so it never pops
+  for (let i = 0; i < 2; i++) { const a = arms[i]; a.clav.updateMatrixWorld(true); vT.set(0, -.03, 0).applyMatrix4(a.hand.matrixWorld); let depth = 0;
+    for (const [node, cy, rx, ry, rz] of COLLIDERS) { vZ.copy(vT); node.worldToLocal(vZ); const f = (vZ.x / rx) ** 2 + ((vZ.y - cy) / ry) ** 2 + (vZ.z / rz) ** 2;
+      if (f < 1) { const k = 1 / Math.sqrt(Math.max(f, 1e-3)); depth = Math.max(depth, (1 - 1 / k) * Math.min(rx, rz)); vZ.set(vZ.x * k, cy + (vZ.y - cy) * k, vZ.z * k); node.localToWorld(vZ); vT.copy(vZ); } }
+    a.cw += ((depth > 0 ? smooth(0, .02, depth) : 0) - a.cw) * (1 - Math.exp(-DT * 16));     // eased in and out over a few frames
+    if (a.cw > .003) { const w = a.cw, qF = a.up.quaternion.clone(), eF = a.fore.rotation.x; vP.set(a.sx * .6 * c - s, -.5, -a.sx * .6 * s - c);
+      solve2(a.up, a.fore, UA, FA, vT, vP, null, null); qB.copy(a.up.quaternion); a.up.quaternion.copy(qF).slerp(qB, w); a.fore.rotation.x = lerp(eF, a.fore.rotation.x, w); } }
+}
+const COLLIDERS = [[head, HY, HR[0] + .1, HR[1] + .1, HR[2] + .1], [spine, .28, .37, .6, .31]];
+const SEC = { top: [0, 1, 1, 0], back: [1, .35, 0, 0], left: [0, .4, 0, -1], right: [0, .4, 0, 1], fringe: [-.6, 1, 1, 0] };   // [rotX<-ay, rotX<-az, rotZ<-ax, rotZ<-ay]
+function secondary() {
+  const sc = S.sec; vA.set(0, 1.0, -.2).applyMatrix4(head.matrixWorld); vC.set(0, .2, -.2).applyMatrix4(chest.matrixWorld);
+  if (!sc.init) { sc.prev.copy(vA); sc.cprev.copy(vC); sc.vel.set(0, 0, 0); sc.cvel.set(0, 0, 0); sc.init = true; }
+  vB.subVectors(vA, sc.prev).multiplyScalar(1 / DT); vD.subVectors(vB, sc.vel).multiplyScalar(1 / DT); sc.vel.copy(vB); sc.prev.copy(vA);
+  if (vD.lengthSq() > 2500) vD.setLength(50); head.matrixWorld.decompose(vE, qA, vX); vD.applyQuaternion(qA.invert());
+  for (const k in clumps) { const h = clumps[k], w = SEC[k], gain = 1;
+    h.vx += (-190 * h.rx - 8.5 * h.vx - gain * (w[0] * vD.y + w[1] * vD.z)) * DT; h.vz += (-190 * h.rz - 8.5 * h.vz + gain * (w[2] * vD.x + w[3] * vD.y)) * DT;
+    h.rx = clamp(h.rx + h.vx * DT, -.3, .3); h.rz = clamp(h.rz + h.vz * DT, -.3, .3); h.g.rotation.set(h.rx, 0, h.rz); }
+  vB.subVectors(vC, sc.cprev).multiplyScalar(1 / DT); vD.subVectors(vB, sc.cvel).multiplyScalar(1 / DT); sc.cvel.copy(vB); sc.cprev.copy(vC); if (vD.lengthSq() > 2500) vD.setLength(50);
+  chest.matrixWorld.decompose(vE, qA, vX); qA.invert(); vB.applyQuaternion(qA); vD.applyQuaternion(qA);
+  for (let i = 0; i < 3; i++) { const s = tail[i], tx = (i ? .08 : .22) + clamp(vB.z * .2, -.3, .75) + (i ? clamp(-vB.y * .12, -.4, .5) : 0) - (i === 0 ? val[CI.srx] + val[CI.crx] : 0) * .7, tz = clamp(vB.x * .16, -.5, .5);
+    s.vx += (90 * (tx - s.rx) - 6.5 * s.vx + .55 * (vD.z - vD.y * .5)) * DT; s.vz += (90 * (tz - s.rz) - 6.5 * s.vz - .5 * vD.x) * DT;
+    s.rx = clamp(s.rx + s.vx * DT, -.6, 1.4); s.rz = clamp(s.rz + s.vz * DT, -.9, .9); s.g.rotation.set(s.rx, 0, s.rz); }
+}
+
+/* ================= camera: story shots ================= */
+const CAMS = {
+  v1: { p: [1.0, 1.7, 9.6], p2: [.5, 1.55, 8.2], t: [-.2, 1.3, 0], t2: [-.45, 1.3, 0], fov: 30, dur: 4 },
+  v2: { p: [-.35, 1.55, 2.6], p2: [-.7, 1.42, 2.0], t: [PED_X, 1.2, 0], fov: 26, dur: 2 },
+  v3: { p: [-5.7, 2.45, 5.3], p2: [-5.2, 2.35, 4.8], head: .02, fov: 30, dur: 2.5 },
+  v4: { p: [-.1, 1.95, 7.6], p2: [-.3, 2.1, 6.6], t: [-.8, 1.7, 0], t2: [-.65, 2.0, 0], fov: 30, dur: 4 },
+  h1: { p: [3.7, 5.0, 10.6], p2: [3.3, 5.5, 11.1], t: [0, .9, 3.3], fov: 40, dur: 4.5 },
+  h2: { p: [.4, 2.15, 5.3], p2: [.32, 2.15, 4.6], head: .05, fov: 34, dur: 3.2 },
+  h3: { p: [.3, 1.45, 7.3], p2: [.22, 1.55, 6.9], t: [-.25, 1.75, 0], t2: [-.2, 1.8, .5], fov: 32, dur: 4.5 },
+  h4: { p: [-1.25, 2.0, -1.98], p2: [-1.1, 2.04, -1.75], head: .02, fov: 42, dur: 2.2 },
+  h5: { p: [1.6, 3.35, 5.9], p2: [1.5, 3.5, 5.5], t: [-.45, 2.8, WALL_Z], t2: [-.5, 3.1, WALL_Z], fov: 36, dur: 4.5 } };
+function cameraStep() {
+  const g = S, cam = g.cam, name = cam.force || 'v1', cut = name !== cam.shot; if (cut) { cam.shot = name; cam.t = 0; } cam.t += DT; const sh = CAMS[name], u = smooth(0, sh.dur, cam.t), t2 = sh.t2 || sh.t;
+  cam.pos.set(lerp(sh.p[0], sh.p2[0], u) + .012 * noise(g.t * .7, 40), lerp(sh.p[1], sh.p2[1], u) + .01 * noise(g.t * .6, 41), lerp(sh.p[2], sh.p2[2], u));
+  if (sh.head !== undefined) { vA.set(0, HY + sh.head, 0).applyMatrix4(head.matrixWorld); if (cut) cam.tgt.copy(vA); else cam.tgt.lerp(vA, 1 - Math.exp(-DT * 6)); } else cam.tgt.set(lerp(sh.t[0], t2[0], u), lerp(sh.t[1], t2[1], u), lerp(sh.t[2], t2[2], u));
+  cam.fov = sh.fov;
+}
+
+/* ================= the story, as a deterministic timeline ================= */
+const REEL = [[0, 'set:vault'], [0, 'tp:2.9,0.1,-1.5708'], [0, 'cam:v1'], [0, 'look:crown'], [0, 'fade:0'], [.25, 'goto:-0.68,0.05,1.15'],
+  [4.0, 'cam:v2'], [5.7, 'cam:v3'], [5.9, 'emo:awe'], [7.4, 'cam:v4'], [7.5, 'crown'],
+  [12.0, 'fade:1'], [12.45, 'set:hall'], [12.45, 'tp:0,-0.3,0'], [12.45, 'cam:h1'], [12.45, 'emo:proud'], [12.45, 'look:knights'], [12.5, 'fade:0'], [13.0, 'knights'],
+  [17.0, 'cam:h2'], [18.0, 'look:cam'],
+  [20.2, 'cam:h3'], [20.2, 'detach'], [20.2, 'emo:happy'], [20.2, 'look:ahead'], [20.4, 'goto:0,2.2,1.0'],
+  [23.4, 'emo:confused'], [23.4, 'face:-3.1416'], [23.4, 'look:wall'], [25.0, 'cam:h4'], [25.2, 'emo:shock'],
+  [27.2, 'cam:h5'], [27.2, 'emo:fear'], [28.6, 'draw'], [31.7, 'fade:1']], REEL_END = 33;
+function step() {
+  const g = S; g.t += DT;
+  if (g.reel) while (g.ri < REEL.length && REEL[g.ri][0] <= g.t) cmd(REEL[g.ri++][1]);
+  if (g.queue.length && (isFree() || (g.act === 'sit' && g.phase === 'hold')) && (BUSY_OK[g.queue[0]] || g.speed < .05)) cmd(g.queue.shift());
+  tgt.set(REST); add.fill(0);
+  const moving = locomotion(); action(); layers(moving);
+  for (let i = 0; i < NC; i++) { cv[i] += (OM[i] * OM[i] * (tgt[i] - cx[i]) - 2 * ZE[i] * OM[i] * cv[i]) * DT; cx[i] += cv[i] * DT; val[i] = cx[i] + add[i]; }
+  feetUpdate(moving); gaze(moving); apply(); secondary(); face(); cameraStep();
+  g.fade += clamp(g.fadeT - g.fade, -DT * 3.6, DT * 3.6); g.flash *= Math.exp(-DT * 3.2); if (g.crowned) g.crownGlow += ((g.set === 'hall' ? .4 : 1.2) - g.crownGlow) * Math.min(1, DT * 2);
+  g.press += ((g.crowned || (g.act === 'crown' && g.phase === 'descend') ? 1 : 0) - g.press) * Math.min(1, DT * 9); clumps.top.g.scale.setScalar(1 - .5 * g.press);   // the crown presses the top tuft down
+}
+/* ================= rendering: silhouette pass → scene → post shader ================= */
+const postScene = new T.Scene(), postCam = new T.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const postMat = new T.ShaderMaterial({ depthTest: false, depthWrite: false, uniforms: { tD: { value: null }, res: { value: new T.Vector2(1, 1) }, uTime: uT, fade: { value: 0 }, flash: { value: 0 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
+  fragmentShader: `varying vec2 vUv; uniform sampler2D tD; uniform vec2 res; uniform float uTime, fade, flash;
+    float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+    void main(){ vec2 uv = vUv, c = uv - .5; float r2 = dot(c, c); vec2 ca = c * r2 * .014;
+      vec3 col = vec3(texture2D(tD, uv + ca).r, texture2D(tD, uv).g, texture2D(tD, uv - ca).b);
+      vec3 bl = vec3(0.); for (int i = 0; i < 16; i++) { float a = float(i) * .3927 * 2.; float rad = i < 8 ? 6. : 14.; vec2 o = vec2(cos(a + (i < 8 ? 0. : .39)), sin(a + (i < 8 ? 0. : .39))) * rad * res.y / 900. / res; bl += max(texture2D(tD, uv + o).rgb - vec3(.9), 0.); }
+      col += bl / 16. * 1.6;                                           // glow around bright gold and the shadow's eyes
+      col = mix(col, vec3(1., .93, .72), flash);
+      col *= 1. - smoothstep(.16, .6, r2) * .7;                        // vignette
+      col = pow(max(col, 0.), vec3(.4545)); col = mix(col, col * col * (3. - 2. * col), .3);
+      col += (h(uv * res + fract(uTime) * 61.) - .5) * .035;           // film grain
+      gl_FragColor = vec4(col * (1. - fade), 1.); }` });
+postScene.add(new T.Mesh(new T.PlaneGeometry(2, 2), postMat));
+
+const easeBack = x => { x = clamp(x, 0, 1); const c = 1.9; return 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2); };
+function shadowAnim() { // extra life for the detached shadow, as a pure function of time
+  const g = S, tau = g.t - g.shadow.detT; spine.scale.y *= 1 + .012 * Math.sin(tau * 1.8);
+  if (g.shadow.drawT < 0) return; const d = g.t - g.shadow.drawT, a = arms[0];
+  const ant = smooth(0, .35, d) * (1 - smooth(.85, 1.15, d)), k1 = smooth(.25, .85, d), k2 = easeBack((d - 1.0) / .5), kh = smooth(0, 1.2, d), settle = d > 1.5 ? Math.exp(-(d - 1.5) * 4) * Math.sin((d - 1.5) * 15) : 0;
+  head.rotation.x += .1 * ant + .26 * kh; head.rotation.z += .1 * kh; spine.rotation.x += .1 * ant + .1 * kh; spine.rotation.y += -.3 * k2; hips.position.y -= .05 * ant;      // gathers itself, then strikes the pose
+  const ax = lerp(lerp(0, -.25, k1), -.1, k2), az = lerp(lerp(.16, -.95, k1), 2.75, k2) + .07 * settle, el = lerp(lerp(.16, 1.5, k1), .12, k2);
+  a.up.rotation.set(ax, 0, -az); a.fore.rotation.set(-el, 0, 0); a.hand.rotation.set(0, 0, .12 * settle); a.clav.rotation.set(0, 0, -.12 * ant - .25 * k2);
+  sword.visible = d > .6; sword.scale.set(1, lerp(.25, 1, smooth(.95, 1.4, d)), 1);
+  arms[1].up.rotation.set(0, 0, .16 + .25 * k2); arms[1].fore.rotation.set(-lerp(.16, .7, k2), 0, 0);
+}
+const snapA = new Float32Array(bones.length * 10); let curSet = '', lastCast = true;
+function applySet(name) { if (name === curSet) return; curSet = name; const v = name === 'vault'; sets.vault.visible = v; sets.hall.visible = !v;
+  hemi.color.set(v ? 0x8f9cff : 0xffe2c4); hemi.groundColor.set(v ? 0x1c1c34 : 0x3a2c40); hemi.intensity = v ? .3 : .4; key.color.set(v ? 0xcfd8ff : 0xffe6c4); key.intensity = v ? .22 : .42;
+  KEY_OFF.set(v ? -1.2 : 3.2, v ? 8.5 : 7.5, v ? 2.0 : 5.5); }
+function draw() {
+  const g = S, c = g.cam, hall = g.set === 'hall'; applySet(g.set); uT.value = g.t;
+  camera.position.copy(c.pos); camera.lookAt(c.tgt); if (camera.fov !== c.fov) { camera.fov = c.fov; camera.updateProjectionMatrix(); }
+  key.position.copy(root.position).add(KEY_OFF); key.target.position.copy(root.position);
+  // crown glow, torches, wall light
+  const fl = .88 + .12 * Math.sin(g.t * 9 + Math.sin(g.t * 23) * 1.5); goldMat.uniforms.glow.value = g.crownGlow; crownLight.intensity = (hall ? .3 : .6) * Math.min(g.crownGlow, 1.4);
+  torchA.intensity = hall ? .6 * fl : 0; torchB.intensity = hall ? .55 * (1.76 - fl) : 0;
+  crown.getWorldPosition(vA); wallV.uniforms.g1.value.set(vA.x, vA.y, vA.z + .8, .55 * g.crownGlow); wallV.uniforms.amb.value = .07;
+  wallH.uniforms.g1.value.set(2.2, 2.85, WALL_Z + .55, 1.5); wallH.uniforms.g2.value.set(-2.6, 2.85, WALL_Z + .55, 1.3); wallH.uniforms.amb.value = .2;
+  if (sets.vault.userData.dust) sets.vault.userData.dust.material.uniforms.scale.value = renderer.domElement.height * .011;
+  // knights bow in a wave
+  for (const k of knights) { const x = g.knightsT < 0 ? -1 : g.t - g.knightsT - k.delay, ant = x <= 0 ? 0 : smooth(0, .16, x) * (1 - smooth(.16, .34, x)), b = x <= .14 ? 0 : easeBack((x - .14) / .75), hb = x <= .24 ? 0 : easeBack((x - .24) / .8);   // straighten, bow, head follows
+    k.lower.scale.y = 1 + .035 * ant - .3 * b; k.up.position.y = .95 * k.lower.scale.y; k.up.rotation.x = -.07 * ant + .72 * b; k.hd.rotation.x = -.12 * ant + .42 * hb; }
+  // once the shadow has left him, the prince casts none
+  const cast = !g.shadow.det; if (cast !== lastCast) { lastCast = cast; for (const m of charMeshes) m.castShadow = cast; }
+  if (hall) { const det = g.shadow.det && g.snapB, dd = g.shadow.drawT < 0 ? -1 : g.t - g.shadow.drawT, eg = dd < 0 ? 0 : smooth(.45, 1.5, dd), sc = 1.15 + .13 * (dd < 0 ? 0 : smooth(0, 2.6, dd));
+    if (det) { snapPose(snapA); restorePose(g.snapB); shadowAnim(); root.updateMatrixWorld(true); }
+    skinTorso(true); renderer.shadowMap.autoUpdate = false; renderer.setRenderTarget(silRT); renderer.setClearColor(0x000000, 0); renderer.clear();
+    scene.overrideMaterial = silMat; silCam.layers.set(1); renderer.render(scene, silCam); scene.overrideMaterial = null;
+    if (eg > 0) { for (const e of eyes) e.u.sil.value = 1; silCam.layers.set(2); renderer.autoClear = false; renderer.render(scene, silCam); renderer.autoClear = true; for (const e of eyes) e.u.sil.value = 0; }
+    sword.visible = false; renderer.shadowMap.autoUpdate = true; renderer.shadowMap.needsUpdate = true;
+    if (det) { restorePose(snapA); root.updateMatrixWorld(true); }
+    const u = wallH.uniforms; u.tSh.value = silRT.texture; u.shOn.value = 1; u.eyeGlow.value = eg * (1.6 + .25 * Math.sin(g.t * 11)); u.shRect.value.set(SH_X - SIL_W / 2 * sc, -.2 * sc, SIL_W * sc, SIL_H * sc); }
+  skinTorso(hall); faceApply(); aoBlob.position.x = g.pos.x; aoBlob.position.z = g.pos.z; aoBlob.material.opacity = g.air ? .4 : 1;
+  renderer.setRenderTarget(mainRT); renderer.setClearColor(0x020308, 1); renderer.render(scene, camera);
+  renderer.setRenderTarget(null); const pu = postMat.uniforms; pu.tD.value = mainRT.texture; pu.res.value.set(mainRT.width, mainRT.height); pu.fade.value = g.fade; pu.flash.value = g.flash; renderer.render(postScene, postCam);
+}
+
+/* ================= sound switch (must be turned on by a click) ================= */
+const sound = (() => { const b = document.getElementById('bSound'); let on = false, actx = null;
+  const ctx = () => { try { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch (e) { actx = null; } return actx; };
+  b.onclick = () => { on = !on; if (on) ctx(); b.textContent = 'Sound: ' + (on ? 'on' : 'off'); };
+  return { ctx: () => on ? ctx() : null };
+})();
+
+/* ================= sound effects + ambience =================
+   Synthesised in the browser (no audio files). The simulation only records event names in sfxQ; this module plays them while the story
+   runs with Sound on, so sound never affects the picture or the deterministic timeline. */
+const sfx = (() => {
+  let c = null, master = null, echo = null, nb = null, idx = 0, amb = null, ambSet = '', nextBit = 0;
+  function init(ctx) { c = ctx; master = c.createGain(); master.gain.value = 0; master.connect(c.destination);
+    const d = c.createDelay(1), fb = c.createGain(), lp = c.createBiquadFilter(); d.delayTime.value = .19; fb.gain.value = .3; lp.type = 'lowpass'; lp.frequency.value = 1700;
+    echo = c.createGain(); echo.gain.value = .3; echo.connect(d); d.connect(lp); lp.connect(fb); fb.connect(d); lp.connect(master);
+    nb = c.createBuffer(1, c.sampleRate * 2, c.sampleRate); const a = nb.getChannelData(0); let s = 12345; for (let i = 0; i < a.length; i++) { s = (s * 16807) % 2147483647; a[i] = s / 1073741823.5 - 1; } }
+  const env = (g, t, at, dur, peak) => { g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + at); g.gain.exponentialRampToValueAtTime(.0001, t + at + dur); };
+  function noise(t, dur, type, f0, f1, peak, q, at) { const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain(); s.buffer = nb; s.loop = true; f.type = type; f.Q.value = q || .7;
+    f.frequency.setValueAtTime(f0, t); if (f1) f.frequency.exponentialRampToValueAtTime(f1, t + dur); env(g, t, at || .004, dur, peak); s.connect(f); f.connect(g); g.connect(master); g.connect(echo); s.start(t, Math.random() * 1.5); s.stop(t + (at || 0) + dur + .1); }
+  function tone(t, f0, f1, dur, peak, type, at) { const o = c.createOscillator(), g = c.createGain(); o.type = type || 'sine'; o.frequency.setValueAtTime(f0, t); if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    env(g, t, at || .004, dur, peak); o.connect(g); g.connect(master); g.connect(echo); o.start(t); o.stop(t + (at || 0) + dur + .1); }
+  const P = {
+    step(t) { const v = .8 + Math.random() * .4; noise(t, .07, 'lowpass', 900 * v, 300, .2); tone(t, 95 * v, 50, .09, .16); noise(t + .02, .03, 'highpass', 3000, 0, .03); },
+    scuff(t) { noise(t, .09, 'bandpass', 700, 350, .09, 1); },
+    touch(t) { tone(t, 1250, 900, .08, .06, 'triangle'); noise(t, .04, 'highpass', 4000, 0, .03); },
+    shimmer(t) { for (const [f, d] of [[880, 0], [1320, .12], [1760, .25], [2640, .4], [3520, .55]]) tone(t + d, f, f * 1.01, 1.3, .035, 'sine', .25); noise(t, 1.4, 'highpass', 6000, 9000, .012, .7, .4); },
+    crown(t) { for (const [f, p] of [[523.25, .12], [784, .09], [1046.5, .08], [1568, .05], [2093, .03]]) tone(t, f, f, 2.2, p, 'sine', .006); noise(t, .5, 'highpass', 7000, 0, .04); tone(t, 130.8, 65, .7, .16); },
+    bow(t) { for (let i = 0; i < 5; i++) { const u = t + .22 + i * .2 + Math.random() * .04, v = .85 + Math.random() * .3; noise(u, .06, 'bandpass', 3200 * v, 0, .07, 4); tone(u, 310 * v, 290 * v, .16, .04, 'square'); noise(u + .05, .22, 'lowpass', 500, 250, .06); } },
+    dread(t) { tone(t, 46, 41, 2.6, .2, 'sine', .9); noise(t, 2.2, 'lowpass', 180, 420, .05, .7, 1.2); },
+    draw(t) { noise(t + .95, .38, 'bandpass', 2200, 8500, .13, 6, .02); for (const f of [3100, 4650, 6200]) tone(t + 1.25, f, f * .995, 1.1, .035, 'sine', .01);
+      tone(t + 1.5, 62, 31, 1.6, .3, 'sine', .02); for (const f of [110, 116.5, 233]) tone(t + 1.5, f, f, 2.2, .06, 'sawtooth', .05); }
+  };
+  function ambience(name, t) { if (name === ambSet) return; ambSet = name; if (amb) { const old = amb; old.g.gain.setTargetAtTime(0, t, .25); setTimeout(() => old.nodes.forEach(n => { try { n.stop(); } catch (e) {} }), 1500); }
+    const g = c.createGain(), vault = name === 'vault', nodes = []; g.gain.value = 0; g.gain.setTargetAtTime(1, t, .6); g.connect(master);
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), ng = c.createGain(); s.buffer = nb; s.loop = true; f.type = 'lowpass'; f.frequency.value = vault ? 210 : 380; ng.gain.value = vault ? .07 : .05; s.connect(f); f.connect(ng); ng.connect(g); s.start(t); nodes.push(s);
+    for (const [fr, p] of vault ? [[55, .03], [82.4, .018]] : [[73.4, .012]]) { const o = c.createOscillator(), og = c.createGain(); o.frequency.value = fr; og.gain.value = p; o.connect(og); og.connect(g); o.start(t); nodes.push(o); }
+    echo.gain.setTargetAtTime(vault ? .5 : .16, t, .2); amb = { g, nodes }; nextBit = t + 1; }
+  function update(playing) { const ctx = sound.ctx(); if (!ctx) { if (master) master.gain.setTargetAtTime(0, c.currentTime, .03); idx = sfxQ.length; return; } if (!c) init(ctx);
+    const t = c.currentTime; master.gain.setTargetAtTime(playing ? 1.5 : 0, t, .04); if (idx > sfxQ.length) idx = 0; if (!playing) { idx = sfxQ.length; return; }
+    ambience(S.set, t); while (idx < sfxQ.length) { const p = P[sfxQ[idx++][1]]; if (p) p(t); }
+    if (t > nextBit) { if (S.set === 'vault') { tone(t, 1900 + Math.random() * 500, 950, .07, .03); nextBit = t + 2 + Math.random() * 3.5; }                           // water drip
+      else { noise(t, .02 + Math.random() * .03, 'bandpass', 1500 + Math.random() * 2500, 0, .025, 2); nextBit = t + .15 + Math.random() * .7; } } }   // torch crackle
+  return { update, skip() { idx = sfxQ.length; } };
+})();
+
+/* ================= playback ================= */
+const bPlay = document.getElementById('bPlay'), scrub = document.getElementById('scrub'), tc = document.getElementById('tc');
+let playing = true, manual = false, last = 0, acc = 0;
+const setPlaying = p => { playing = p; bPlay.textContent = p ? 'Pause' : 'Play'; };
+function seek(t) { if (t < S.t - 1e-6) reset(true); while (S.t + 1e-9 < t) step(); sfx.skip(); }
+bPlay.onclick = () => setPlaying(!playing); view.onclick = () => setPlaying(!playing);
+document.getElementById('bRe').onclick = () => { reset(true); setPlaying(true); };
+scrub.oninput = () => { seek(scrub.value / 1000 * REEL_END); };
+reset(true); step(); draw();
+function frame(now) { requestAnimationFrame(frame); if (manual) return; const dt = Math.min(.1, (now - last) / 1000 || 0); last = now;
+  if (playing) { acc += dt; let n = 0; while (acc >= DT && n < 24) { step(); acc -= DT; n++; } if (n === 24) acc = 0; if (S.t > REEL_END) reset(true); scrub.value = Math.round(S.t / REEL_END * 1000); }
+  sfx.update(playing); tc.textContent = S.t.toFixed(1).padStart(4, '0'); draw(); }
+requestAnimationFrame(frame);
+// Frame-by-frame capture: STORY.renderAt(seconds) always draws the same picture for the same time.
+window.STORY = { duration: REEL_END, renderAt(t) { manual = true; seek(t); draw(); return S.t; }, live() { manual = false; },
+  state() { let h = 0; for (let i = 0; i < NC; i++) h += val[i] * (i + 1); return { t: S.t, hash: h + S.pos.x * 7 + S.pos.z * 11 + S.heading + crown.position.y, act: S.act, phase: S.phase, emo: S.emo, set: S.set, speed: S.speed, crowned: S.crowned, det: S.shadow.det, calls: renderer.info.render.calls, px: S.pos.x, pz: S.pos.z, hd: S.heading, cam: S.cam.pos.toArray().map(v => +v.toFixed(2)), tgt: S.cam.tgt.toArray().map(v => +v.toFixed(2)), fov: camera.fov }; } };
+})();
+</script>
+</body>
+</html>
